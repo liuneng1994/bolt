@@ -229,8 +229,10 @@ std::unique_ptr<SeekableInputStream> DirectBufferedInput::enqueue(
   }
 
   TrackingId id;
+  auto ioReadClass = IoReadClass::kLegacy;
   if (sid) {
     id = TrackingId(sid->getId());
+    ioReadClass = sid->ioReadClass();
   }
   BOLT_CHECK_LE(region.offset + region.length, fileSize_);
   if (tracker_) {
@@ -247,7 +249,7 @@ std::unique_ptr<SeekableInputStream> DirectBufferedInput::enqueue(
       groupId_,
       options_.loadQuantum());
   if (!preloaded()) {
-    requests_.emplace_back(region, id);
+    requests_.emplace_back(region, id, ioReadClass);
     requests_.back().stream = stream.get();
   }
   return stream;
@@ -283,6 +285,19 @@ bool DirectBufferedInput::isBuffered(uint64_t /*offset*/, uint64_t /*length*/)
 
 bool DirectBufferedInput::shouldPreload(int32_t numPages) {
   return false;
+}
+
+void DirectBufferedInput::setLoadQuantum(int32_t loadQuantum) {
+  BOLT_CHECK_GT(loadQuantum, 0);
+  BOLT_CHECK(
+      coalescedLoads_.empty(), "Cannot change quantum after planning loads");
+  options_.setLoadQuantum(loadQuantum);
+  for (auto& request : requests_) {
+    auto* stream = const_cast<DirectInputStream*>(
+        dynamic_cast<const DirectInputStream*>(request.stream));
+    BOLT_CHECK_NOT_NULL(stream);
+    stream->setLoadQuantum(loadQuantum);
+  }
 }
 
 namespace {
@@ -324,6 +339,7 @@ void DirectBufferedInput::load(const LogType /*unused*/) {
   // After load, new requests cannot be merged into pre-load ones.
   auto requests = std::move(requests_);
   std::vector<LoadRequest*> storageLoad[2];
+  std::vector<LoadRequest*> deferredOutputLoad;
   for (auto& request : requests) {
     cache::TrackingData trackingData;
     const bool prefetchAnyway = request.trackingId.empty() ||
@@ -331,14 +347,18 @@ void DirectBufferedInput::load(const LogType /*unused*/) {
     if (!prefetchAnyway && tracker_) {
       trackingData = tracker_->trackingData(request.trackingId);
     }
-    const int loadIndex =
-        (prefetchAnyway || isPrefetchablePct(adjustedReadPct(trackingData)))
-        ? 1
-        : 0;
+    const bool prefetch =
+        prefetchAnyway || isPrefetchablePct(adjustedReadPct(trackingData));
+    if (request.ioReadClass == IoReadClass::kOutput && !prefetch) {
+      deferredOutputLoad.push_back(&request);
+      continue;
+    }
+    const int loadIndex = prefetch ? 1 : 0;
     storageLoad[loadIndex].push_back(&request);
   }
   std::sort(storageLoad[1].begin(), storageLoad[1].end(), lessThan);
   std::sort(storageLoad[0].begin(), storageLoad[0].end(), lessThan);
+  std::sort(deferredOutputLoad.begin(), deferredOutputLoad.end(), lessThan);
   std::vector<int32_t> groupEnds[2];
   groupEnds[1] = groupRequests(storageLoad[1], true);
   moveCoalesced(
@@ -352,6 +372,22 @@ void DirectBufferedInput::load(const LogType /*unused*/) {
   groupEnds[0] = groupRequests(storageLoad[0], false);
   readRegions(storageLoad[1], true, groupEnds[1]);
   readRegions(storageLoad[0], false, groupEnds[0]);
+  auto deferredGroupEnds = groupRequests(deferredOutputLoad, false);
+  readRegions(deferredOutputLoad, false, deferredGroupEnds);
+}
+
+void DirectBufferedInput::loadDeferredOutput(const LogType logType) {
+  if (!executor_) {
+    load(logType);
+    return;
+  }
+  for (auto& request : requests_) {
+    request.region.length =
+        std::min<uint64_t>(request.region.length, options_.loadQuantum());
+    request.trackingId = TrackingId(StreamIdentifier::sequentialFile().id_);
+    request.ioReadClass = IoReadClass::kLegacy;
+  }
+  load(logType);
 }
 
 std::vector<int32_t> DirectBufferedInput::groupRequests(

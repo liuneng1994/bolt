@@ -204,6 +204,13 @@ std::shared_ptr<WriterProperties::Builder> getArrowParquetWriterOptionsBuilder(
       : properties->disable_store_decimal_as_integer();
   properties = properties->version(options.parquetVersion);
   properties = properties->data_page_version(options.dataPageVersion);
+  if (options.writePageIndex) {
+    properties = properties->enable_write_page_index();
+  }
+  for (const auto& [path, writePageIndex] : options.columnWritePageIndexMap) {
+    properties = writePageIndex ? properties->enable_write_page_index(path)
+                                : properties->disable_write_page_index(path);
+  }
   return builder;
 }
 
@@ -251,6 +258,13 @@ std::string WriterOptionsToString(const WriterOptions& options) {
   oss << "  compression: " << static_cast<int>(options.compression)
       << std::endl;
   oss << "  encoding: " << static_cast<int>(options.encoding) << std::endl;
+  oss << "  writePageIndex: " << (options.writePageIndex ? "true" : "false")
+      << std::endl;
+  oss << "  columnWritePageIndexMap: {";
+  for (const auto& [key, value] : options.columnWritePageIndexMap) {
+    oss << key << ": " << (value ? "true" : "false") << ", ";
+  }
+  oss << "}" << std::endl;
   oss << "  memoryPool: " << options.memoryPool << std::endl;
 
   oss << "  columnCompressionsMap: {";

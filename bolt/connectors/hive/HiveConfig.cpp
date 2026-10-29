@@ -326,6 +326,20 @@ bool HiveConfig::isDictionaryFilterEnabled() const {
   return config_->get<bool>(kParquetDictionaryFilterEnabled, false);
 }
 
+bool HiveConfig::isParquetLateMaterializationEnabled(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kParquetLateMaterializationEnabledSession,
+      config_->get<bool>(kParquetLateMaterializationEnabled, false));
+}
+
+uint64_t HiveConfig::parquetLateMaterializationReadLatencyUs(
+    const config::ConfigBase* session) const {
+  return session->get<uint64_t>(
+      kParquetLateMaterializationReadLatencyUsSession,
+      config_->get<uint64_t>(kParquetLateMaterializationReadLatencyUs, 0));
+}
+
 int32_t HiveConfig::decodeRepDefPageCount() const {
   auto value = config_->get<int32_t>(kParquetDecodeRepDefPageCount, 10);
   return std::max(value, 1);

@@ -50,8 +50,11 @@ namespace bytedance::bolt::dwio::common {
 
 struct LoadRequest {
   LoadRequest() = default;
-  LoadRequest(bolt::common::Region& _region, cache::TrackingId _trackingId)
-      : region(_region), trackingId(_trackingId) {}
+  LoadRequest(
+      bolt::common::Region& _region,
+      cache::TrackingId _trackingId,
+      IoReadClass _ioReadClass)
+      : region(_region), trackingId(_trackingId), ioReadClass(_ioReadClass) {}
 
   bool operator<(const LoadRequest& other) const {
     return region.offset < other.region.offset ||
@@ -61,6 +64,7 @@ struct LoadRequest {
 
   bolt::common::Region region;
   cache::TrackingId trackingId;
+  IoReadClass ioReadClass{IoReadClass::kLegacy};
 
   const SeekableInputStream* stream;
 
@@ -211,6 +215,22 @@ class DirectBufferedInput : public BufferedInput {
   }
 
   void load(const LogType /*unused*/) override;
+
+  void loadDeferredOutput(const LogType logType) override;
+
+  void setLoadQuantum(int32_t loadQuantum) override;
+
+  int32_t loadQuantum() const override {
+    return options_.loadQuantum();
+  }
+
+  uint64_t estimatedReadLatencyUs() const override {
+    return options_.estimatedReadLatencyUs();
+  }
+
+  const io::IoStatistics* FOLLY_NULLABLE ioStatistics() const override {
+    return ioStats_.get();
+  }
 
   bool isBuffered(uint64_t offset, uint64_t length) const override;
 

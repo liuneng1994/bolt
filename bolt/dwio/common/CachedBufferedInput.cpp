@@ -56,12 +56,14 @@ std::unique_ptr<SeekableInputStream> CachedBufferedInput::enqueue(
   }
 
   TrackingId id;
+  auto ioReadClass = IoReadClass::kLegacy;
   if (si) {
     id = TrackingId(si->getId());
+    ioReadClass = si->ioReadClass();
   }
   BOLT_CHECK_LE(region.offset + region.length, fileSize_);
   requests_.emplace_back(
-      RawFileCacheKey{fileNum_, region.offset}, region.length, id);
+      RawFileCacheKey{fileNum_, region.offset}, region.length, id, ioReadClass);
   if (tracker_) {
     tracker_->recordReference(id, region.length, fileNum_, groupId_);
   }
@@ -128,6 +130,25 @@ bool CachedBufferedInput::shouldPreload(int32_t numPages) {
   return false;
 }
 
+void CachedBufferedInput::setLoadQuantum(int32_t loadQuantum) {
+  BOLT_CHECK_GT(loadQuantum, 0);
+  BOLT_CHECK(
+      allCoalescedLoads_.empty(), "Cannot change quantum after planning loads");
+  options_.setLoadQuantum(loadQuantum);
+  for (auto& request : requests_) {
+    auto* stream = const_cast<CacheInputStream*>(
+        dynamic_cast<const CacheInputStream*>(request.stream));
+    BOLT_CHECK_NOT_NULL(stream);
+    stream->setLoadQuantum(loadQuantum);
+    if (request.pairedStream) {
+      auto* pairedStream = const_cast<CacheInputStream*>(
+          dynamic_cast<const CacheInputStream*>(request.pairedStream));
+      BOLT_CHECK_NOT_NULL(pairedStream);
+      pairedStream->setLoadQuantum(loadQuantum);
+    }
+  }
+}
+
 namespace {
 
 bool isPrefetchPct(int32_t pct) {
@@ -159,7 +180,8 @@ std::vector<CacheRequest*> makeRequestParts(
     extraRequests.push_back(std::make_unique<CacheRequest>(
         RawFileCacheKey{request.key.fileNum, request.key.offset + offset},
         size,
-        request.trackingId));
+        request.trackingId,
+        request.ioReadClass));
     parts.push_back(extraRequests.back().get());
     parts.back()->coalesces = prefetch;
     parts.back()->stream = request.stream;
@@ -204,6 +226,8 @@ void CachedBufferedInput::load(const LogType) {
   std::vector<std::unique_ptr<CacheRequest>> extraRequests;
   std::vector<CacheRequest*> storageLoad[2];
   std::vector<CacheRequest*> ssdLoad[2];
+  std::vector<CacheRequest*> deferredStorageLoad;
+  std::vector<CacheRequest*> deferredSsdLoad;
   for (auto& request : requests) {
     cache::TrackingData trackingData;
     const bool prefetchAnyway = request.trackingId.empty() ||
@@ -211,9 +235,9 @@ void CachedBufferedInput::load(const LogType) {
     if (!prefetchAnyway && (tracker_ != nullptr)) {
       trackingData = tracker_->trackingData(request.trackingId);
     }
-    const int loadIndex =
-        (prefetchAnyway || isPrefetchPct(adjustedReadPct(trackingData))) ? 1
-                                                                         : 0;
+    const bool prefetch =
+        prefetchAnyway || isPrefetchPct(adjustedReadPct(trackingData));
+    const int loadIndex = prefetch ? 1 : 0;
     auto parts = makeRequestParts(
         request, trackingData, options_.loadQuantum(), extraRequests);
     for (auto part : parts) {
@@ -228,11 +252,19 @@ void CachedBufferedInput::load(const LogType) {
           part->ssdPin.clear();
         }
         if (!part->ssdPin.empty()) {
-          ssdLoad[loadIndex].push_back(part);
+          if (part->ioReadClass == IoReadClass::kOutput && !prefetch) {
+            deferredSsdLoad.push_back(part);
+          } else {
+            ssdLoad[loadIndex].push_back(part);
+          }
           continue;
         }
       }
-      storageLoad[loadIndex].push_back(part);
+      if (part->ioReadClass == IoReadClass::kOutput && !prefetch) {
+        deferredStorageLoad.push_back(part);
+      } else {
+        storageLoad[loadIndex].push_back(part);
+      }
     }
   }
 
@@ -242,6 +274,29 @@ void CachedBufferedInput::load(const LogType) {
   std::sort(ssdLoad[1].begin(), ssdLoad[1].end(), lessThan<true>);
   makeLoads<false>(storageLoad);
   makeLoads<true>(ssdLoad);
+
+  std::sort(
+      deferredStorageLoad.begin(), deferredStorageLoad.end(), lessThan<false>);
+  auto deferredStorageGroupEnds =
+      groupRequests<false>(deferredStorageLoad, false);
+  readRegions(deferredStorageLoad, false, deferredStorageGroupEnds);
+
+  std::sort(deferredSsdLoad.begin(), deferredSsdLoad.end(), lessThan<true>);
+  auto deferredSsdGroupEnds = groupRequests<true>(deferredSsdLoad, false);
+  readRegions(deferredSsdLoad, false, deferredSsdGroupEnds);
+}
+
+void CachedBufferedInput::loadDeferredOutput(const LogType logType) {
+  if (!executor_) {
+    load(logType);
+    return;
+  }
+  for (auto& request : requests_) {
+    request.size = std::min<uint64_t>(request.size, options_.loadQuantum());
+    request.trackingId = TrackingId(StreamIdentifier::sequentialFile().id_);
+    request.ioReadClass = IoReadClass::kLegacy;
+  }
+  load(logType);
 }
 
 template <bool kSsd>

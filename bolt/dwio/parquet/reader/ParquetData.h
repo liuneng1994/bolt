@@ -150,7 +150,27 @@ class ParquetData : public dwio::common::FormatData {
   }
 
   /// Prepares to read data for 'index'th row group.
-  void enqueueRowGroup(uint32_t index, dwio::common::BufferedInput& input);
+  void enqueueRowGroup(
+      uint32_t index,
+      dwio::common::BufferedInput& input,
+      dwio::common::IoReadClass ioReadClass =
+          dwio::common::IoReadClass::kLegacy,
+      bool enqueueOffsetIndex = false,
+      dwio::common::BufferedInput* FOLLY_NULLABLE offsetIndexInput = nullptr);
+
+  bool hasOffsetIndex(uint32_t index) const {
+    const auto& chunk = rowGroups_[index].columns[type_->column()];
+    return chunk.__isset.offset_index_offset &&
+        chunk.__isset.offset_index_length && !chunk.__isset.crypto_metadata &&
+        chunk.offset_index_offset >= 0 && chunk.offset_index_length > 0;
+  }
+
+  uint32_t offsetIndexLength(uint32_t index) const {
+    return hasOffsetIndex(index)
+        ? static_cast<uint32_t>(
+              rowGroups_[index].columns[type_->column()].offset_index_length)
+        : 0;
+  }
 
   /// Positions 'this' at 'index'th row group. loadRowGroup must be called
   /// first. The returned PositionProvider is empty and should not be used.
@@ -158,6 +178,17 @@ class ParquetData : public dwio::common::FormatData {
   dwio::common::PositionProvider seekToRowGroup(int64_t index) override;
 
   void releaseRowGroupReader();
+
+  uint64_t compressedSize(uint32_t index) const {
+    const auto& chunk = rowGroups_[index].columns[type_->column()];
+    BOLT_CHECK(chunk.__isset.meta_data);
+    BOLT_CHECK_GE(chunk.meta_data.total_compressed_size, 0);
+    return chunk.meta_data.total_compressed_size;
+  }
+
+  bool prefetchSelectedPages(const RowSet& topLevelRows) {
+    return reader_ && reader_->prefetchSelectedPages(topLevelRows);
+  }
 
   void filterRowGroups(
       const common::ScanSpec& scanSpec,
@@ -340,6 +371,9 @@ class ParquetData : public dwio::common::FormatData {
   std::vector<std::unique_ptr<dwio::common::SeekableInputStream>> streams_;
   std::vector<std::unique_ptr<dwio::common::SeekableInputStream>>
       repDefStreams_;
+  std::vector<std::unique_ptr<dwio::common::SeekableInputStream>>
+      offsetIndexStreams_;
+  std::vector<uint32_t> offsetIndexLengths_;
   std::vector<int64_t> rowGroupOffsets_;
 
   const uint32_t maxDefine_;

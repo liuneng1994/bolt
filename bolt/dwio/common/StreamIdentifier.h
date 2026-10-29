@@ -38,16 +38,35 @@ namespace bytedance::bolt::dwio::common {
 
 constexpr uint32_t MAX_UINT32 = std::numeric_limits<uint32_t>::max();
 
+/// Describes how a stream participates in read planning.
+///
+/// kLegacy preserves the existing access-frequency-based planning. kFilter and
+/// kOutput let readers keep low-frequency output-only streams out of loads
+/// needed to evaluate filters. An output stream may still be promoted by the
+/// BufferedInput implementation when its observed access frequency is high.
+enum class IoReadClass : uint8_t {
+  kLegacy,
+  kFilter,
+  kOutput,
+};
+
 class StreamIdentifier {
  public:
   StreamIdentifier() : id_(MAX_UINT32) {}
 
-  explicit StreamIdentifier(int32_t id) : id_(id) {}
+  explicit StreamIdentifier(
+      int32_t id,
+      IoReadClass ioReadClass = IoReadClass::kLegacy)
+      : id_(id), ioReadClass_(ioReadClass) {}
 
   virtual ~StreamIdentifier() = default;
 
   virtual int32_t getId() const {
     return id_;
+  }
+
+  IoReadClass ioReadClass() const {
+    return ioReadClass_;
   }
 
   virtual bool operator==(const StreamIdentifier& other) const {
@@ -70,6 +89,9 @@ class StreamIdentifier {
   }
 
   int32_t id_;
+
+ private:
+  IoReadClass ioReadClass_{IoReadClass::kLegacy};
 };
 
 struct StreamIdentifierHash {

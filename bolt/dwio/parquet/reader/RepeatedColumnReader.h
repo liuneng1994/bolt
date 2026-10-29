@@ -94,7 +94,10 @@ class MapColumnReader : public dwio::common::SelectiveMapColumnReader {
 
   void seekToRowGroup(int64_t index) override;
 
-  void enqueueRowGroup(uint32_t index, dwio::common::BufferedInput& input);
+  void enqueueRowGroup(
+      uint32_t index,
+      dwio::common::BufferedInput& input,
+      dwio::common::BufferedInput* FOLLY_NULLABLE offsetIndexInput = nullptr);
 
   void read(
       int64_t offset,
@@ -161,7 +164,10 @@ class ListColumnReader : public dwio::common::SelectiveListColumnReader {
 
   void seekToRowGroup(int64_t index) override;
 
-  void enqueueRowGroup(uint32_t index, dwio::common::BufferedInput& input);
+  void enqueueRowGroup(
+      uint32_t index,
+      dwio::common::BufferedInput& input,
+      dwio::common::BufferedInput* FOLLY_NULLABLE offsetIndexInput = nullptr);
 
   void read(
       int64_t offset,

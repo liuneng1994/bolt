@@ -31,6 +31,7 @@
 #pragma once
 
 #include <cstdint>
+#include <future>
 #include "bolt/common/caching/FileIds.h"
 #include "bolt/common/caching/ScanTracker.h"
 #include "bolt/common/io/IoStatistics.h"
@@ -64,6 +65,15 @@ class DirectInputStream : public SeekableInputStream {
   std::string getName() const override;
   size_t positionSize() override;
 
+  bool prefetchRanges(
+      const std::vector<bolt::common::Region>& regions) override;
+
+  void setLoadQuantum(int32_t loadQuantum) {
+    BOLT_CHECK(!loaded_, "Cannot change quantum after stream load");
+    BOLT_CHECK_GT(loadQuantum, 0);
+    loadQuantum_ = loadQuantum;
+  }
+
   /// Testing function to access loaded state.
   void testingData(
       bolt::common::Region& loadedRegion,
@@ -77,6 +87,8 @@ class DirectInputStream : public SeekableInputStream {
  private:
   // Ensures that the current position is covered by 'data_'.
   void loadPosition();
+
+  bool loadPrefetchedPosition();
 
   // Synchronously sets 'data_' to cover loadedRegion_'.
   void loadSync();
@@ -92,7 +104,7 @@ class DirectInputStream : public SeekableInputStream {
   const uint64_t groupId_;
 
   // Maximum number of bytes read from 'input' at a time.
-  const int32_t loadQuantum_;
+  int32_t loadQuantum_;
 
   // The part of 'region_' that is loaded into 'data_'/'tinyData_'. Relative to
   // file start.
@@ -127,6 +139,15 @@ class DirectInputStream : public SeekableInputStream {
   bool loaded_{false};
 
   uint64_t loadAddr_{0};
+
+  struct PrefetchedRegion {
+    bolt::common::Region region;
+    std::string data;
+    std::shared_future<void> ready;
+    std::atomic_bool accounted{false};
+  };
+  std::vector<std::shared_ptr<PrefetchedRegion>> prefetchedRegions_;
+  std::shared_ptr<PrefetchedRegion> currentPrefetchedRegion_;
 };
 
 } // namespace bytedance::bolt::dwio::common

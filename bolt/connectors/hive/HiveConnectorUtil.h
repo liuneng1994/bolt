@@ -31,6 +31,7 @@
 #pragma once
 #include <folly/Executor.h>
 #include <folly/container/F14Map.h>
+#include <folly/container/F14Set.h>
 
 #include "bolt/connectors/Connector.h"
 #include "bolt/connectors/hive/FileHandle.h"
@@ -75,6 +76,14 @@ std::shared_ptr<common::ScanSpec> makeScanSpec(
     dwio::common::RuntimeStatistics* statis = nullptr,
     const std::vector<std::tuple<size_t, std::optional<std::string>>>&
         rowIndexColumns = {});
+
+/// Separates filter-input columns from output-only columns for Parquet read
+/// planning. Leaves the whole tree in kLegacy mode unless both classes are
+/// present, preserving the existing behavior for unfiltered scans and scans
+/// where all projected columns are also filter inputs.
+void configureParquetIoReadClasses(
+    common::ScanSpec& scanSpec,
+    const folly::F14FastSet<std::string>& remainingFilterFields);
 
 void configureReaderOptions(
     dwio::common::ReaderOptions& readerOptions,

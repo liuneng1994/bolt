@@ -233,6 +233,15 @@ class HiveConfig {
   static constexpr const char* kParquetDictionaryFilterEnabled =
       "parquet.dictionary_filter.enabled";
 
+  static constexpr const char* kParquetLateMaterializationEnabled =
+      "hive.parquet.late-materialization-enabled";
+  static constexpr const char* kParquetLateMaterializationEnabledSession =
+      "hive_parquet_late_materialization_enabled";
+  static constexpr const char* kParquetLateMaterializationReadLatencyUs =
+      "hive.parquet.late-materialization-read-latency-us";
+  static constexpr const char* kParquetLateMaterializationReadLatencyUsSession =
+      "hive_parquet_late_materialization_read_latency_us";
+
   static constexpr const char* kParquetDecodeRepDefPageCount =
       "parquet_decode_repdef_page_count";
 
@@ -318,6 +327,12 @@ class HiveConfig {
   /// @param session The configuration object to check
   /// @return true if dictionary filtering should be used, false otherwise
   bool isDictionaryFilterEnabled() const;
+
+  bool isParquetLateMaterializationEnabled(
+      const config::ConfigBase* session) const;
+
+  uint64_t parquetLateMaterializationReadLatencyUs(
+      const config::ConfigBase* session) const;
 
   // For array/map types, if all decoded reps/defs levels of a single column
   // chunk cannot fit in memory, they need to be decoded in every N pages This

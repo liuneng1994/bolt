@@ -89,6 +89,7 @@ void ColumnLoader::loadInternal(
     effectiveRows = RowSet(selectedRows);
   }
 
+  structReader_->prepareOutputRead(effectiveRows);
   structReader_->advanceFieldReader(fieldReader_, offset);
   fieldReader_->scanSpec()->setValueHook(hook);
   fieldReader_->read(offset, effectiveRows, incomingNulls);

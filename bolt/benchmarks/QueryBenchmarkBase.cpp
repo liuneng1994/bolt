@@ -30,6 +30,10 @@
 
 #include "bolt/benchmarks/QueryBenchmarkBase.h"
 
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
+
+#include "bolt/common/base/GlobalParameters.h"
+
 DEFINE_string(bolt_benchmark_data_format, "parquet", "Data format");
 
 DEFINE_validator(
@@ -111,6 +115,16 @@ DEFINE_int32(
     "Number of next row groups to "
     "prefetch. 1 means prefetch the next row group before decoding "
     "the current one");
+
+DEFINE_bool(
+    bolt_benchmark_parquet_late_materialization,
+    false,
+    "Enable staged predicate/output reads for Parquet");
+
+DEFINE_uint64(
+    bolt_benchmark_parquet_read_latency_us,
+    0,
+    "Estimated fixed storage read latency used by staged-read cost planning");
 
 DEFINE_int32(
     bolt_benchmark_split_preload_per_driver,
@@ -196,7 +210,8 @@ void QueryBenchmarkBase::initialize() {
   filesystems::registerLocalFileSystem();
 
   ioExecutor_ = std::make_unique<folly::IOThreadPoolExecutor>(
-      FLAGS_bolt_benchmark_num_io_threads);
+      FLAGS_bolt_benchmark_num_io_threads,
+      std::make_shared<folly::NamedThreadFactory>(kAsyncPreloadThreadName));
 
   // Add new values into the hive configuration...
   auto configurationValues = std::unordered_map<std::string, std::string>();
@@ -206,6 +221,12 @@ void QueryBenchmarkBase::initialize() {
       FLAGS_bolt_benchmark_max_coalesced_distance_bytes;
   configurationValues[connector::hive::HiveConfig::kPrefetchRowGroups] =
       std::to_string(FLAGS_bolt_benchmark_parquet_prefetch_rowgroups);
+  configurationValues
+      [connector::hive::HiveConfig::kParquetLateMaterializationEnabled] =
+          FLAGS_bolt_benchmark_parquet_late_materialization ? "true" : "false";
+  configurationValues
+      [connector::hive::HiveConfig::kParquetLateMaterializationReadLatencyUs] =
+          std::to_string(FLAGS_bolt_benchmark_parquet_read_latency_us);
   auto properties = std::make_shared<const config::ConfigBase>(
       std::move(configurationValues));
 

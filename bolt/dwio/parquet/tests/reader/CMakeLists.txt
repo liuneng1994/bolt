@@ -32,6 +32,7 @@ add_executable(
   bolt_dwio_parquet_reader_test
   ParquetReaderTest.cpp
   ParquetPageReaderTest.cpp
+  ParquetLateMaterializationTest.cpp
   NestedStructureDecoderTest.cpp
 )
 
@@ -60,6 +61,17 @@ target_link_libraries(
 add_executable(bolt_dwio_parquet_reader_benchmark ParquetReaderBenchmark.cpp)
 target_link_libraries(
   bolt_dwio_parquet_reader_benchmark
+  PRIVATE
+    bolt_testutils
+    ${FOLLY_BENCHMARK}
+)
+
+add_executable(
+  bolt_dwio_parquet_late_materialization_benchmark
+  ParquetLateMaterializationBenchmark.cpp
+)
+target_link_libraries(
+  bolt_dwio_parquet_late_materialization_benchmark
   PRIVATE
     bolt_testutils
     ${FOLLY_BENCHMARK}

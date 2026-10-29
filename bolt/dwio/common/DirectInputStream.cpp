@@ -128,6 +128,79 @@ size_t DirectInputStream::positionSize() {
   return 1;
 }
 
+bool DirectInputStream::prefetchRanges(const std::vector<Region>& regions) {
+  auto* executor = bufferedInput_->executor();
+  if (!executor || regions.empty()) {
+    return false;
+  }
+  prefetchedRegions_.reserve(prefetchedRegions_.size() + regions.size());
+  for (const auto& region : regions) {
+    BOLT_CHECK_GT(region.length, 0);
+    BOLT_CHECK_LE(region.offset, region_.length);
+    BOLT_CHECK_LE(region.length, region_.length - region.offset);
+    auto prefetched = std::make_shared<PrefetchedRegion>();
+    prefetched->region = region;
+    prefetched->data.resize(region.length);
+    auto promise = std::make_shared<std::promise<void>>();
+    prefetched->ready = promise->get_future().share();
+    auto input = input_;
+    const auto fileOffset = region_.offset + region.offset;
+    executor->add([prefetched, promise, input, fileOffset]() {
+      try {
+        input->read(
+            prefetched->data.data(),
+            prefetched->data.size(),
+            fileOffset,
+            MetricsLog::MetricsType::FILE);
+        promise->set_value();
+      } catch (...) {
+        promise->set_exception(std::current_exception());
+      }
+    });
+    prefetchedRegions_.push_back(std::move(prefetched));
+  }
+  std::sort(
+      prefetchedRegions_.begin(),
+      prefetchedRegions_.end(),
+      [](const auto& left, const auto& right) {
+        return left->region.offset < right->region.offset;
+      });
+  return true;
+}
+
+bool DirectInputStream::loadPrefetchedPosition() {
+  auto it = std::upper_bound(
+      prefetchedRegions_.begin(),
+      prefetchedRegions_.end(),
+      offsetInRegion_,
+      [](uint64_t offset, const auto& region) {
+        return offset < region->region.offset;
+      });
+  if (it == prefetchedRegions_.begin()) {
+    return false;
+  }
+  --it;
+  auto& prefetched = *it;
+  if (offsetInRegion_ >=
+      prefetched->region.offset + prefetched->region.length) {
+    return false;
+  }
+  prefetched->ready.get();
+  if (!prefetched->accounted.exchange(true) && ioStats_) {
+    ioStats_->read().increment(prefetched->region.length);
+    ioStats_->prefetch().increment(prefetched->region.length);
+  }
+  currentPrefetchedRegion_ = prefetched;
+  loaded_ = true;
+  loadedRegion_.offset = region_.offset + prefetched->region.offset;
+  loadedRegion_.length = prefetched->region.length;
+  run_ = reinterpret_cast<uint8_t*>(prefetched->data.data());
+  runSize_ = prefetched->data.size();
+  offsetInRun_ = offsetInRegion_ - prefetched->region.offset;
+  offsetOfRun_ = 0;
+  return true;
+}
+
 namespace {
 std::vector<folly::Range<char*>>
 makeRanges(size_t size, memory::Allocation& data, std::string& tinyData) {
@@ -186,6 +259,9 @@ void DirectInputStream::loadPosition() {
     offsetInRun_ = 0;
     offsetOfRun_ = 0;
     BOLT_CHECK_GT(runSize_, 0);
+    return;
+  }
+  if (loadPrefetchedPosition()) {
     return;
   }
   if (!loaded_) {

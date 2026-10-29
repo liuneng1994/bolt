@@ -63,6 +63,15 @@ class CacheInputStream : public SeekableInputStream {
   std::string getName() const override;
   size_t positionSize() override;
 
+  bool prefetchRanges(
+      const std::vector<bolt::common::Region>& regions) override;
+
+  void setLoadQuantum(int32_t loadQuantum) {
+    BOLT_CHECK_EQ(position_, 0, "Cannot change quantum after stream access");
+    BOLT_CHECK_GT(loadQuantum, 0);
+    loadQuantum_ = loadQuantum;
+  }
+
   /// Returns a copy of 'this', ranging over the same bytes. The clone
   /// is initially positioned at the position of 'this' and can be
   /// moved independently within 'region_'.  This is used for first
@@ -141,7 +150,7 @@ class CacheInputStream : public SeekableInputStream {
 
   // Maximum number of bytes read from 'input' at a time. This gives the maximum
   // pin_.entry()->size().
-  const int32_t loadQuantum_;
+  int32_t loadQuantum_;
 
   // Handle of cache entry.
   cache::CachePin pin_;

@@ -60,6 +60,11 @@ TEST(HiveConfigTest, defaultConfig) {
   ASSERT_EQ(hiveConfig.gcsCredentialsPath(), "");
   ASSERT_EQ(hiveConfig.isOrcUseColumnNames(emptySession.get()), false);
   ASSERT_EQ(hiveConfig.isParquetUseColumnNames(emptySession.get()), false);
+  ASSERT_FALSE(
+      hiveConfig.isParquetLateMaterializationEnabled(emptySession.get()));
+  ASSERT_EQ(
+      hiveConfig.parquetLateMaterializationReadLatencyUs(emptySession.get()),
+      0);
   ASSERT_EQ(
       hiveConfig.isFileColumnNamesReadAsLowerCase(emptySession.get()), false);
 
@@ -101,6 +106,8 @@ TEST(HiveConfigTest, overrideConfig) {
       {HiveConfig::kOrcUseColumnNames, "true"},
       {HiveConfig::kFileColumnNamesReadAsLowerCase, "true"},
       {HiveConfig::kParquetUseColumnNames, "true"},
+      {HiveConfig::kParquetLateMaterializationEnabled, "true"},
+      {HiveConfig::kParquetLateMaterializationReadLatencyUs, "123"},
       {HiveConfig::kMaxCoalescedBytes, "100"},
       {HiveConfig::kMaxCoalescedDistanceBytes, "100B"},
       {HiveConfig::kNumCacheFileHandles, "100"},
@@ -133,6 +140,11 @@ TEST(HiveConfigTest, overrideConfig) {
   ASSERT_EQ(hiveConfig.gcsCredentialsPath(), "hey");
   ASSERT_EQ(hiveConfig.isOrcUseColumnNames(emptySession.get()), true);
   ASSERT_EQ(hiveConfig.isParquetUseColumnNames(emptySession.get()), true);
+  ASSERT_TRUE(
+      hiveConfig.isParquetLateMaterializationEnabled(emptySession.get()));
+  ASSERT_EQ(
+      hiveConfig.parquetLateMaterializationReadLatencyUs(emptySession.get()),
+      123);
   ASSERT_EQ(
       hiveConfig.isFileColumnNamesReadAsLowerCase(emptySession.get()), true);
   ASSERT_EQ(hiveConfig.maxCoalescedBytes(emptySession.get()), 100);
@@ -158,6 +170,8 @@ TEST(HiveConfigTest, overrideSession) {
       {HiveConfig::kOrcUseColumnNamesSession, "true"},
       {HiveConfig::kFileColumnNamesReadAsLowerCaseSession, "true"},
       {HiveConfig::kParquetUseColumnNamesSession, "true"},
+      {HiveConfig::kParquetLateMaterializationEnabledSession, "true"},
+      {HiveConfig::kParquetLateMaterializationReadLatencyUsSession, "456"},
       {HiveConfig::kOrcWriterMaxStripeSizeSession, "22MB"},
       {HiveConfig::kOrcWriterMaxDictionaryMemorySession, "22MB"},
       {HiveConfig::kSortWriterMaxOutputRowsSession, "20"},
@@ -186,6 +200,9 @@ TEST(HiveConfigTest, overrideSession) {
   ASSERT_EQ(hiveConfig.gcsCredentialsPath(), "");
   ASSERT_EQ(hiveConfig.isOrcUseColumnNames(session.get()), true);
   ASSERT_EQ(hiveConfig.isParquetUseColumnNames(session.get()), true);
+  ASSERT_TRUE(hiveConfig.isParquetLateMaterializationEnabled(session.get()));
+  ASSERT_EQ(
+      hiveConfig.parquetLateMaterializationReadLatencyUs(session.get()), 456);
   ASSERT_EQ(hiveConfig.isFileColumnNamesReadAsLowerCase(session.get()), true);
 
   ASSERT_EQ(hiveConfig.maxCoalescedBytes(session.get()), 128 << 20);

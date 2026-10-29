@@ -217,13 +217,21 @@ void skipUnreadLengthsAndNulls(dwio::common::SelectiveColumnReader& reader) {
 void enqueueChildren(
     dwio::common::SelectiveColumnReader* reader,
     uint32_t index,
-    dwio::common::BufferedInput& input) {
+    dwio::common::BufferedInput& input,
+    dwio::common::BufferedInput* offsetIndexInput) {
   auto children = reader->children();
   if (children.empty()) {
-    return reader->formatData().as<ParquetData>().enqueueRowGroup(index, input);
+    const auto readClass = reader->scanSpec()->ioReadClass();
+    const bool stagedOutput = offsetIndexInput != nullptr;
+    return reader->formatData().as<ParquetData>().enqueueRowGroup(
+        index,
+        input,
+        stagedOutput ? readClass : dwio::common::IoReadClass::kLegacy,
+        stagedOutput && readClass == dwio::common::IoReadClass::kOutput,
+        offsetIndexInput);
   }
   for (auto* child : children) {
-    enqueueChildren(child, index, input);
+    enqueueChildren(child, index, input, offsetIndexInput);
   }
 }
 } // namespace
@@ -303,8 +311,9 @@ MapColumnReader::MapColumnReader(
 
 void MapColumnReader::enqueueRowGroup(
     uint32_t index,
-    dwio::common::BufferedInput& input) {
-  enqueueChildren(this, index, input);
+    dwio::common::BufferedInput& input,
+    dwio::common::BufferedInput* offsetIndexInput) {
+  enqueueChildren(this, index, input, offsetIndexInput);
 }
 
 void MapColumnReader::seekToRowGroup(int64_t index) {
@@ -435,8 +444,9 @@ ListColumnReader::ListColumnReader(
 
 void ListColumnReader::enqueueRowGroup(
     uint32_t index,
-    dwio::common::BufferedInput& input) {
-  enqueueChildren(this, index, input);
+    dwio::common::BufferedInput& input,
+    dwio::common::BufferedInput* offsetIndexInput) {
+  enqueueChildren(this, index, input, offsetIndexInput);
 }
 
 void ListColumnReader::seekToRowGroup(int64_t index) {

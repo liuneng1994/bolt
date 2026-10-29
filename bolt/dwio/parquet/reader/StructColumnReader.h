@@ -30,9 +30,13 @@
 
 #pragma once
 
+#include <limits>
+#include <unordered_map>
+
 #include "bolt/dwio/common/Options.h"
 #include "bolt/dwio/common/SelectiveStructColumnReader.h"
 #include "bolt/dwio/parquet/arrow/LevelConversion.h"
+#include "bolt/dwio/parquet/reader/ParquetLateMaterialization.h"
 namespace bytedance::bolt::dwio::common {
 class BufferedInput;
 }
@@ -56,6 +60,8 @@ class StructColumnReader : public dwio::common::SelectiveStructColumnReader {
       override;
 
   void seekToRowGroup(int64_t index) override;
+
+  void prepareOutputRead(const RowSet& rows) override;
 
   void releaseRowGroupReader();
 
@@ -103,9 +109,53 @@ class StructColumnReader : public dwio::common::SelectiveStructColumnReader {
       dwio::common::BufferedInput& input) const override;
 
  private:
+  static constexpr int32_t kSparseOutputLoadQuantum = 256 << 10;
+
+  struct RowGroupReadContext {
+    RowGroupReadContext(
+        ParquetLateMaterializationState::Strategy strategy,
+        std::shared_ptr<dwio::common::BufferedInput> outputInput)
+        : state(strategy), outputInput(std::move(outputInput)) {}
+
+    ParquetLateMaterializationState state;
+    std::shared_ptr<dwio::common::BufferedInput> outputInput;
+    uint64_t lastObservedRead{std::numeric_limits<uint64_t>::max()};
+    uint64_t lastPrefetchedRead{std::numeric_limits<uint64_t>::max()};
+  };
+
+  struct OutputIoEstimate {
+    uint64_t bytes{0};
+    uint32_t columns{0};
+    uint64_t indexedBytes{0};
+    uint32_t indexedColumns{0};
+    uint64_t indexedPagesEstimate{0};
+  };
+
   dwio::common::SelectiveColumnReader* findBestLeaf();
 
   void enqueueRowGroup(uint32_t index, dwio::common::BufferedInput& input);
+
+  void enqueueRowGroup(
+      uint32_t index,
+      dwio::common::BufferedInput& initialInput,
+      dwio::common::BufferedInput* FOLLY_NULLABLE outputInput);
+
+  bool hasLateMaterializationRoles() const;
+
+  bool hasOutputOffsetIndex(uint32_t index) const;
+
+  bool prefetchOutputPages(const RowSet& rows);
+
+  OutputIoEstimate estimateOutputIo(uint32_t index) const;
+
+  bool shouldUseTwoPhase(
+      uint32_t index,
+      const dwio::common::BufferedInput& input) const;
+
+  void observeSelection(
+      RowGroupReadContext& context,
+      uint64_t selectedRows,
+      uint64_t selectedSpanRows);
 
   bool isRowGroupBuffered(uint32_t index, dwio::common::BufferedInput& input);
 
@@ -120,6 +170,10 @@ class StructColumnReader : public dwio::common::SelectiveStructColumnReader {
   // The level information for extracting nulls for 'this' from the
   // repdefs in a leaf PageReader.
   arrow::LevelInfo levelInfo_;
+
+  ParquetLateMaterializationPolicy lateMaterializationPolicy_;
+  std::unordered_map<uint32_t, RowGroupReadContext> rowGroupReadContexts_;
+  int64_t currentRowGroup_{-1};
 };
 
 } // namespace bytedance::bolt::parquet

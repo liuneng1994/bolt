@@ -114,6 +114,30 @@ class BufferedInput {
   /// load all regions to be read in an optimized way (IO efficiency)
   virtual void load(const LogType);
 
+  /// Schedules the first load quantum of each enqueued output stream. This is
+  /// used after the final row selection is known to overlap independent HDFS
+  /// reads without prefetching the full output column chunks.
+  virtual void loadDeferredOutput(const LogType logType) {
+    load(logType);
+  }
+
+  /// Changes the maximum demand-read size for requests enqueued since the last
+  /// load(). Implementations that support staged reads override this method.
+  /// Callers must set the quantum before load() or the first stream access.
+  virtual void setLoadQuantum(int32_t /*loadQuantum*/) {}
+
+  virtual int32_t loadQuantum() const {
+    return 0;
+  }
+
+  virtual uint64_t estimatedReadLatencyUs() const {
+    return 0;
+  }
+
+  virtual const io::IoStatistics* FOLLY_NULLABLE ioStatistics() const {
+    return nullptr;
+  }
+
   virtual bool isBuffered(uint64_t offset, uint64_t length) const {
     return !!readBuffer(offset, length);
   }

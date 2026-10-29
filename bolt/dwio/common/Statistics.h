@@ -603,6 +603,10 @@ struct RuntimeStatistics {
   // column that produced no output rows.
   uint64_t filteredOutPages{0};
 
+  uint64_t offsetIndexBytesRead{0};
+  uint64_t offsetIndexPagesSkipped{0};
+  uint64_t offsetIndexFallbacks{0};
+
   ColumnReaderStatistics columnReaderStatistics;
 
   void merge(const RuntimeStatistics& other) {
@@ -616,6 +620,9 @@ struct RuntimeStatistics {
     decodeTimeNs += other.decodeTimeNs;
     totalPages += other.totalPages;
     filteredOutPages += other.filteredOutPages;
+    offsetIndexBytesRead += other.offsetIndexBytesRead;
+    offsetIndexPagesSkipped += other.offsetIndexPagesSkipped;
+    offsetIndexFallbacks += other.offsetIndexFallbacks;
     columnReaderStatistics.flattenStringDictionaryValues =
         other.columnReaderStatistics.flattenStringDictionaryValues;
   }
@@ -632,6 +639,10 @@ struct RuntimeStatistics {
          RuntimeCounter(decodeTimeNs, RuntimeCounter::Unit::kNanos)},
         {"totalPages", RuntimeCounter(totalPages)},
         {"filteredOutPages", RuntimeCounter(filteredOutPages)},
+        {"offsetIndexBytesRead",
+         RuntimeCounter(offsetIndexBytesRead, RuntimeCounter::Unit::kBytes)},
+        {"offsetIndexPagesSkipped", RuntimeCounter(offsetIndexPagesSkipped)},
+        {"offsetIndexFallbacks", RuntimeCounter(offsetIndexFallbacks)},
         {"flattenStringDictionaryValues",
          RuntimeCounter(columnReaderStatistics.flattenStringDictionaryValues)},
         {"processedStrides", RuntimeCounter(processedStrides)},

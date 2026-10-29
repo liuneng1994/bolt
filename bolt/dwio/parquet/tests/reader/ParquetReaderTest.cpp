@@ -30,11 +30,14 @@
 
 #include "bolt/common/base/SparkCompatibility.h"
 
+#include <thrift/protocol/TCompactProtocol.h>
+#include <thrift/transport/TBufferTransports.h>
 #include <type/HugeInt.h>
 #include <type/Type.h>
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include "bolt/common/base/tests/GTestUtils.h"
 #include "bolt/core/QueryCtx.h"
@@ -137,6 +140,59 @@ template <typename T>
 FlatVector<T>* loadedFlatChildAt(RowVector* row, vector_size_t index) {
   return loadedChildAt(row, index)->asFlatVector<T>();
 }
+
+uint32_t readUint32LE(const char* data) {
+  return static_cast<uint8_t>(data[0]) | (static_cast<uint8_t>(data[1]) << 8) |
+      (static_cast<uint8_t>(data[2]) << 16) |
+      (static_cast<uint8_t>(data[3]) << 24);
+}
+
+void corruptOffsetIndex(
+    const std::string& path,
+    int32_t rowGroup,
+    int32_t column) {
+  std::ifstream input(path, std::ios::binary);
+  BOLT_CHECK(input.good(), "Failed to open Parquet file: {}", path);
+  std::string file(
+      (std::istreambuf_iterator<char>(input)),
+      std::istreambuf_iterator<char>());
+  BOLT_CHECK_GE(file.size(), 12);
+  BOLT_CHECK_EQ(file.substr(file.size() - 4), "PAR1");
+
+  const auto footerLength = readUint32LE(file.data() + file.size() - 8);
+  BOLT_CHECK_LE(footerLength + 8, file.size());
+  const auto footerOffset = file.size() - 8 - footerLength;
+  thrift::FileMetaData metadata;
+  auto buffer = std::make_shared<apache::thrift::transport::TMemoryBuffer>(
+      reinterpret_cast<uint8_t*>(file.data() + footerOffset),
+      footerLength,
+      apache::thrift::transport::TMemoryBuffer::OBSERVE);
+  apache::thrift::protocol::TCompactProtocol protocol(buffer);
+  metadata.read(&protocol);
+
+  BOLT_CHECK_LT(rowGroup, metadata.row_groups.size());
+  BOLT_CHECK_LT(column, metadata.row_groups[rowGroup].columns.size());
+  const auto& chunk = metadata.row_groups[rowGroup].columns[column];
+  BOLT_CHECK(chunk.__isset.offset_index_offset);
+  BOLT_CHECK(chunk.__isset.offset_index_length);
+  BOLT_CHECK_GT(chunk.offset_index_length, 0);
+  BOLT_CHECK_GE(chunk.offset_index_offset, 0);
+  BOLT_CHECK_LE(
+      chunk.offset_index_offset + chunk.offset_index_length, footerOffset);
+
+  std::fstream output(path, std::ios::binary | std::ios::in | std::ios::out);
+  BOLT_CHECK(output.good(), "Failed to update Parquet file: {}", path);
+  output.seekp(chunk.offset_index_offset);
+  const std::string corruptBytes(chunk.offset_index_length, '\0');
+  output.write(corruptBytes.data(), corruptBytes.size());
+  BOLT_CHECK(output.good(), "Failed to corrupt OffsetIndex in: {}", path);
+}
+
+struct OffsetIndexScanResult {
+  std::vector<std::string> rows;
+  uint64_t rawBytesRead{0};
+  dwio::common::RuntimeStatistics runtimeStats;
+};
 
 } // namespace
 
@@ -291,6 +347,9 @@ class ParquetReaderTest : public ParquetTestBase {
  public:
   static constexpr vector_size_t kFusedLevelConversionRows = 12'000;
   static constexpr uint32_t kFusedLevelConversionSeed = 20260730;
+  static constexpr vector_size_t kOffsetIndexRows = 4'096;
+  static constexpr vector_size_t kOffsetIndexSelectionBegin = 3'072;
+  static constexpr vector_size_t kOffsetIndexSelectionEnd = 3'328;
 
   std::shared_ptr<exec::test::TempFilePath> writeTempParquet(
       const std::vector<RowVectorPtr>& data,
@@ -311,6 +370,153 @@ class ParquetReaderTest : public ParquetTestBase {
     }
     writer->close();
     return tempFile;
+  }
+
+  std::shared_ptr<exec::test::TempFilePath> writeTempParquetRowGroups(
+      const std::vector<RowVectorPtr>& data,
+      bytedance::bolt::parquet::WriterOptions options) {
+    BOLT_CHECK_GT(data.size(), 0);
+
+    auto tempFile = exec::test::TempFilePath::create();
+    auto writeFile =
+        std::make_unique<LocalWriteFile>(tempFile->getPath(), true, false);
+    auto sink = std::make_unique<dwio::common::WriteFileSink>(
+        std::move(writeFile), tempFile->getPath());
+    options.memoryPool = rootPool_.get();
+    auto writer = std::make_unique<bytedance::bolt::parquet::Writer>(
+        std::move(sink), options, asRowType(data[0]->type()));
+    for (const auto& batch : data) {
+      writer->write(batch);
+      writer->flush();
+    }
+    writer->close();
+    return tempFile;
+  }
+
+  FlatVectorPtr<int64_t> makeOffsetIndexFilter() {
+    return makeFlatVector<int64_t>(kOffsetIndexRows, [](vector_size_t row) {
+      return row >= kOffsetIndexSelectionBegin && row < kOffsetIndexSelectionEnd
+          ? 1
+          : 0;
+    });
+  }
+
+  FlatVectorPtr<StringView> makeOffsetIndexPayload(
+      int32_t rowGroup,
+      uint64_t salt) {
+    return makeFlatVector<std::string>(
+        kOffsetIndexRows, [rowGroup, salt](vector_size_t row) {
+          std::string value(512, '\0');
+          uint64_t state = (static_cast<uint64_t>(rowGroup) << 48) ^
+              (static_cast<uint64_t>(row) << 16) ^ salt;
+          for (auto& byte : value) {
+            state = state * 6'364'136'223'846'793'005ULL +
+                1'442'695'040'888'963'407ULL;
+            byte = static_cast<char>(state >> 56);
+          }
+          return value;
+        });
+  }
+
+  RowVectorPtr makeOffsetIndexScalarRowGroup(
+      int32_t rowGroup,
+      bool dictionary = false,
+      bool twoPayloads = false) {
+    std::vector<std::string> names{"filter_key", "indexed_payload"};
+    std::vector<VectorPtr> children{makeOffsetIndexFilter()};
+    if (dictionary) {
+      children.push_back(makeFlatVector<std::string>(
+          kOffsetIndexRows, [rowGroup](vector_size_t row) {
+            const auto dictionaryId = row % 1'024;
+            auto value =
+                fmt::format("dictionary-{}-{}-", rowGroup, dictionaryId);
+            value.resize(512, static_cast<char>('a' + dictionaryId % 26));
+            return value;
+          }));
+    } else {
+      children.push_back(makeOffsetIndexPayload(rowGroup, 17));
+    }
+    if (twoPayloads) {
+      names.push_back("sequential_payload");
+      children.push_back(makeOffsetIndexPayload(rowGroup, 31));
+    }
+    return makeRowVector(std::move(names), std::move(children));
+  }
+
+  RowVectorPtr makeOffsetIndexNestedRowGroup(int32_t rowGroup) {
+    auto values = makeArrayVector<int64_t>(
+        kOffsetIndexRows,
+        [](vector_size_t row) { return row % 13 == 0 ? 0 : row % 8 + 24; },
+        [rowGroup](vector_size_t row, vector_size_t index) {
+          return static_cast<int64_t>(rowGroup) * 1'000'000 + row * 10 + index;
+        },
+        [](vector_size_t row) { return row % 17 == 0; });
+    return makeRowVector(
+        {"filter_key", "nested_payload"}, {makeOffsetIndexFilter(), values});
+  }
+
+  OffsetIndexScanResult readOffsetIndexFile(
+      const std::string& path,
+      const RowTypePtr& rowType,
+      bool splitIo) {
+    auto ioStats = std::make_shared<io::IoStatistics>();
+    auto tracker = std::make_shared<cache::ScanTracker>(
+        "offset-index-test", nullptr, 256 << 10);
+    auto file = std::make_shared<LocalReadFile>(path);
+    dwio::common::ReaderOptions readerOptions{leafPool_.get()};
+    readerOptions.setFilePreloadThreshold(0)
+        .setLoadQuantum(256 << 10)
+        .setMaxCoalesceBytes(16 << 20)
+        .setMaxCoalesceDistance(0)
+        .setPrefetchRowGroups(1);
+    auto input = std::make_unique<DirectBufferedInput>(
+        file,
+        MetricsLog::voidLog(),
+        1,
+        tracker,
+        1,
+        ioStats,
+        nullptr,
+        readerOptions,
+        nullptr);
+    auto reader =
+        std::make_unique<ParquetReader>(std::move(input), readerOptions);
+
+    OffsetIndexScanResult result;
+    auto scanSpec = std::make_shared<ScanSpec>("");
+    scanSpec->setRuntimeStatistics(&result.runtimeStats);
+    scanSpec->addAllChildFields(*rowType);
+    auto* filterSpec = scanSpec->childByName("filter_key");
+    BOLT_CHECK_NOT_NULL(filterSpec);
+    filterSpec->setFilter(exec::equal(int64_t{1}));
+    scanSpec->resetCachedValues(true);
+    if (splitIo) {
+      filterSpec->setIoReadClassRecursively(IoReadClass::kFilter);
+      for (column_index_t i = 1; i < rowType->size(); ++i) {
+        scanSpec->childByName(rowType->nameOf(i))
+            ->setIoReadClassRecursively(IoReadClass::kOutput);
+      }
+    }
+
+    RowReaderOptions rowReaderOptions;
+    rowReaderOptions.select(
+        std::make_shared<ColumnSelector>(rowType, rowType->names()));
+    rowReaderOptions.setScanSpec(scanSpec);
+    auto rowReader = reader->createRowReader(rowReaderOptions);
+
+    VectorPtr batch = BaseVector::create(rowType, 0, leafPool_.get());
+    while (rowReader->next(kOffsetIndexRows, batch)) {
+      auto* rows = batch->asUnchecked<RowVector>();
+      for (column_index_t i = 0; i < rows->childrenSize(); ++i) {
+        rows->childAt(i)->loadedVector();
+      }
+      for (vector_size_t row = 0; row < rows->size(); ++row) {
+        result.rows.push_back(rows->toString(row));
+      }
+    }
+    rowReader->updateRuntimeStats(result.runtimeStats);
+    result.rawBytesRead = ioStats->rawBytesRead();
+    return result;
   }
 
   std::unique_ptr<dwio::common::RowReader> createRowReaderFromPath(
@@ -475,6 +681,130 @@ class ParquetReaderTest : public ParquetTestBase {
     }
   }
 };
+
+TEST_F(ParquetReaderTest, offsetIndexSkipsScalarOutputPages) {
+  auto first = makeOffsetIndexScalarRowGroup(0);
+  auto second = makeOffsetIndexScalarRowGroup(1);
+  auto third = makeOffsetIndexScalarRowGroup(2);
+  bytedance::bolt::parquet::WriterOptions options;
+  options.enableDictionary = false;
+  options.compression = common::CompressionKind_SNAPPY;
+  options.dataPageSize = 64 << 10;
+  options.maxRowsPerDataPage = 256;
+  options.writePageIndex = true;
+  auto file = writeTempParquetRowGroups({first, second, third}, options);
+  const auto rowType = asRowType(first->type());
+
+  const auto legacy = readOffsetIndexFile(file->getPath(), rowType, false);
+  const auto indexed = readOffsetIndexFile(file->getPath(), rowType, true);
+
+  EXPECT_EQ(indexed.rows, legacy.rows);
+  EXPECT_LT(indexed.rawBytesRead, legacy.rawBytesRead);
+  EXPECT_GT(indexed.runtimeStats.offsetIndexBytesRead, 0);
+  EXPECT_GT(indexed.runtimeStats.offsetIndexPagesSkipped, 0);
+  EXPECT_EQ(indexed.runtimeStats.offsetIndexFallbacks, 0);
+}
+
+TEST_F(ParquetReaderTest, offsetIndexPreparesDictionaryBeforeJump) {
+  auto first = makeOffsetIndexScalarRowGroup(0, true);
+  auto second = makeOffsetIndexScalarRowGroup(1, true);
+  auto third = makeOffsetIndexScalarRowGroup(2, true);
+  bytedance::bolt::parquet::WriterOptions options;
+  options.enableDictionary = true;
+  options.dictionaryPageSizeLimit = 1 << 20;
+  options.dataPageSize = 1 << 10;
+  options.maxRowsPerDataPage = 256;
+  options.writePageIndex = true;
+  auto file = writeTempParquetRowGroups({first, second, third}, options);
+  const auto rowType = asRowType(first->type());
+
+  const auto legacy = readOffsetIndexFile(file->getPath(), rowType, false);
+  const auto indexed = readOffsetIndexFile(file->getPath(), rowType, true);
+
+  EXPECT_EQ(indexed.rows, legacy.rows);
+  EXPECT_GT(indexed.runtimeStats.offsetIndexBytesRead, 0);
+  EXPECT_GT(indexed.runtimeStats.offsetIndexPagesSkipped, 0);
+  EXPECT_EQ(indexed.runtimeStats.offsetIndexFallbacks, 0);
+}
+
+TEST_F(ParquetReaderTest, corruptOffsetIndexFallsBackToSequentialRead) {
+  auto first = makeOffsetIndexScalarRowGroup(0);
+  auto second = makeOffsetIndexScalarRowGroup(1);
+  auto third = makeOffsetIndexScalarRowGroup(2);
+  bytedance::bolt::parquet::WriterOptions options;
+  options.enableDictionary = false;
+  options.compression = common::CompressionKind_SNAPPY;
+  options.dataPageSize = 64 << 10;
+  options.maxRowsPerDataPage = 256;
+  options.writePageIndex = true;
+  auto file = writeTempParquetRowGroups({first, second, third}, options);
+  corruptOffsetIndex(file->getPath(), 2, 1);
+  const auto rowType = asRowType(first->type());
+
+  const auto legacy = readOffsetIndexFile(file->getPath(), rowType, false);
+  const auto indexed = readOffsetIndexFile(file->getPath(), rowType, true);
+
+  EXPECT_EQ(indexed.rows, legacy.rows);
+  EXPECT_GT(indexed.runtimeStats.offsetIndexBytesRead, 0);
+  EXPECT_GT(indexed.runtimeStats.offsetIndexFallbacks, 0);
+}
+
+TEST_F(ParquetReaderTest, mixedOffsetIndexUsesPerLeafFallback) {
+  auto first = makeOffsetIndexScalarRowGroup(0, false, true);
+  auto second = makeOffsetIndexScalarRowGroup(1, false, true);
+  auto third = makeOffsetIndexScalarRowGroup(2, false, true);
+  bytedance::bolt::parquet::WriterOptions options;
+  options.enableDictionary = false;
+  options.compression = common::CompressionKind_SNAPPY;
+  options.dataPageSize = 64 << 10;
+  options.maxRowsPerDataPage = 256;
+  options.columnWritePageIndexMap["indexed_payload"] = true;
+  options.columnWritePageIndexMap["sequential_payload"] = false;
+  auto file = writeTempParquetRowGroups({first, second, third}, options);
+  const auto rowType = asRowType(first->type());
+
+  const auto legacy = readOffsetIndexFile(file->getPath(), rowType, false);
+  const auto indexed = readOffsetIndexFile(file->getPath(), rowType, true);
+
+  EXPECT_EQ(indexed.rows, legacy.rows);
+  EXPECT_GT(indexed.runtimeStats.offsetIndexBytesRead, 0);
+  EXPECT_GT(indexed.runtimeStats.offsetIndexPagesSkipped, 0);
+  EXPECT_EQ(indexed.runtimeStats.offsetIndexFallbacks, 0);
+}
+
+TEST_F(ParquetReaderTest, nestedOffsetIndexV2AndV1Fallback) {
+  for (const auto pageVersion :
+       {bytedance::bolt::parquet::arrow::ParquetDataPageVersion::V2,
+        bytedance::bolt::parquet::arrow::ParquetDataPageVersion::V1}) {
+    SCOPED_TRACE(
+        fmt::format("pageVersion={}", static_cast<int32_t>(pageVersion)));
+    auto first = makeOffsetIndexNestedRowGroup(0);
+    auto second = makeOffsetIndexNestedRowGroup(1);
+    auto third = makeOffsetIndexNestedRowGroup(2);
+    bytedance::bolt::parquet::WriterOptions options;
+    options.enableDictionary = false;
+    options.dataPageSize = 16 << 10;
+    options.maxRowsPerDataPage = 128;
+    options.dataPageVersion = pageVersion;
+    options.writePageIndex = true;
+    auto file = writeTempParquetRowGroups({first, second, third}, options);
+    const auto rowType = asRowType(first->type());
+
+    const auto legacy = readOffsetIndexFile(file->getPath(), rowType, false);
+    const auto indexed = readOffsetIndexFile(file->getPath(), rowType, true);
+
+    EXPECT_EQ(indexed.rows, legacy.rows);
+    EXPECT_GT(indexed.runtimeStats.offsetIndexBytesRead, 0);
+    if (pageVersion ==
+        bytedance::bolt::parquet::arrow::ParquetDataPageVersion::V2) {
+      EXPECT_GT(indexed.runtimeStats.offsetIndexPagesSkipped, 0);
+      EXPECT_EQ(indexed.runtimeStats.offsetIndexFallbacks, 0);
+    } else {
+      EXPECT_EQ(indexed.runtimeStats.offsetIndexPagesSkipped, 0);
+      EXPECT_GT(indexed.runtimeStats.offsetIndexFallbacks, 0);
+    }
+  }
+}
 
 TEST_F(ParquetReaderTest, parseDecimal) {
   // decimal_int96.parquet holds one column (s: Decimal(28, 10))

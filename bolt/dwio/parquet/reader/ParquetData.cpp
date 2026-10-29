@@ -355,10 +355,15 @@ bool ParquetData::rowGroupMatches(
 
 void ParquetData::enqueueRowGroup(
     uint32_t index,
-    dwio::common::BufferedInput& input) {
+    dwio::common::BufferedInput& input,
+    dwio::common::IoReadClass ioReadClass,
+    bool enqueueOffsetIndex,
+    dwio::common::BufferedInput* offsetIndexInput) {
   auto& chunk = rowGroups_[index].columns[type_->column()];
   streams_.resize(rowGroups_.size());
   repDefStreams_.resize(rowGroups_.size());
+  offsetIndexStreams_.resize(rowGroups_.size());
+  offsetIndexLengths_.resize(rowGroups_.size());
   BOLT_CHECK(
       chunk.__isset.meta_data,
       "ColumnMetaData does not exist for schema Id ",
@@ -377,7 +382,7 @@ void ParquetData::enqueueRowGroup(
       ? metaData.total_uncompressed_size
       : metaData.total_compressed_size;
 
-  auto id = dwio::common::StreamIdentifier(type_->column());
+  auto id = dwio::common::StreamIdentifier(type_->column(), ioReadClass);
   const auto region = common::Region{chunkReadOffset, readSize};
   const bool useStreamingRepDefs = parquetRepDefStreamingWindowSize_ != 0 &&
       maxRepeat_ > 0 && maxDefine_ > 0 && !chunk.__isset.crypto_metadata;
@@ -387,6 +392,20 @@ void ParquetData::enqueueRowGroup(
     repDefStreams_[index] = std::move(repDefStream);
   } else {
     streams_[index] = input.enqueue(region, &id);
+  }
+
+  if ((enqueueOffsetIndex ||
+       ioReadClass == dwio::common::IoReadClass::kOutput) &&
+      hasOffsetIndex(index)) {
+    const auto indexLength = static_cast<uint32_t>(chunk.offset_index_length);
+    auto& indexInput = offsetIndexInput ? *offsetIndexInput : input;
+    const auto indexId = dwio::common::StreamIdentifier(
+        type_->column(), dwio::common::IoReadClass::kOutput);
+    offsetIndexStreams_[index] = indexInput.enqueue(
+        common::Region{
+            static_cast<uint64_t>(chunk.offset_index_offset), indexLength},
+        &indexId);
+    offsetIndexLengths_[index] = indexLength;
   }
 }
 
@@ -410,6 +429,21 @@ dwio::common::PositionProvider ParquetData::seekToRowGroup(int64_t index) {
   reader_->setParquetRepDefMemoryLimit(parquetRepDefMemoryLimit_);
   reader_->setParquetRepDefStreamingWindowSize(
       parquetRepDefStreamingWindowSize_);
+
+  uint64_t chunkReadOffset = metadata.data_page_offset;
+  if (metadata.__isset.dictionary_page_offset &&
+      metadata.dictionary_page_offset >= 4) {
+    chunkReadOffset = metadata.dictionary_page_offset;
+  }
+  if (index < offsetIndexStreams_.size() && offsetIndexStreams_[index]) {
+    reader_->setOffsetIndexStream(
+        std::move(offsetIndexStreams_[index]),
+        offsetIndexLengths_[index],
+        chunkReadOffset,
+        rowGroups_[index].num_rows,
+        metadata.__isset.dictionary_page_offset &&
+            metadata.dictionary_page_offset >= 4);
+  }
 
   if (columnChunkMeta.__isset.crypto_metadata) {
     std::shared_ptr<Decryptor> metaDecryptor;

@@ -152,6 +152,41 @@ size_t CacheInputStream::positionSize() {
   return 1;
 }
 
+bool CacheInputStream::prefetchRanges(const std::vector<Region>& regions) {
+  if (!bufferedInput_->executor() || regions.empty()) {
+    return false;
+  }
+
+  std::vector<Region> cacheRegions;
+  cacheRegions.reserve(regions.size());
+  for (const auto& region : regions) {
+    BOLT_CHECK_GT(region.length, 0);
+    BOLT_CHECK_LE(region.offset, region_.length);
+    BOLT_CHECK_LE(region.length, region_.length - region.offset);
+    const auto begin = region.offset / loadQuantum_ * loadQuantum_;
+    const auto end = std::min<uint64_t>(
+        region_.length,
+        (region.offset + region.length + loadQuantum_ - 1) / loadQuantum_ *
+            loadQuantum_);
+    if (!cacheRegions.empty() &&
+        cacheRegions.back().offset + cacheRegions.back().length >= begin) {
+      cacheRegions.back().length =
+          std::max(
+              cacheRegions.back().offset + cacheRegions.back().length, end) -
+          cacheRegions.back().offset;
+    } else {
+      cacheRegions.push_back(Region{begin, end - begin});
+    }
+  }
+
+  bool scheduled = false;
+  for (const auto& region : cacheRegions) {
+    scheduled |= bufferedInput_->prefetch(
+        Region{region_.offset + region.offset, region.length});
+  }
+  return scheduled;
+}
+
 void CacheInputStream::setRemainingBytes(uint64_t remainingBytes) {
   BOLT_CHECK_GE(region_.length, position_ + remainingBytes);
   window_ = Region{static_cast<uint64_t>(position_), remainingBytes};

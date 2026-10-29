@@ -42,6 +42,7 @@ ScanSpec& ScanSpec::operator=(const ScanSpec& other) {
     constantValue_ = other.constantValue_;
     projectOut_ = other.projectOut_;
     extractValues_ = other.extractValues_;
+    ioReadClass_ = other.ioReadClass_;
     makeFlat_ = other.makeFlat_;
     filter_ = other.filter_;
     metadataFilters_ = other.metadataFilters_;

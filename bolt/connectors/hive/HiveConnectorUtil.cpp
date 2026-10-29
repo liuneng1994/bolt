@@ -437,6 +437,37 @@ std::shared_ptr<common::ScanSpec> makeScanSpec(
   return spec;
 }
 
+void configureParquetIoReadClasses(
+    common::ScanSpec& scanSpec,
+    const folly::F14FastSet<std::string>& remainingFilterFields) {
+  std::vector<common::ScanSpec*> filterInputs;
+  std::vector<common::ScanSpec*> outputOnly;
+
+  for (auto* child : scanSpec.stableChildren()) {
+    child->setIoReadClassRecursively(dwio::common::IoReadClass::kLegacy);
+    if (!child->readFromFile()) {
+      continue;
+    }
+    if (child->hasFilter() ||
+        remainingFilterFields.contains(child->fieldName())) {
+      filterInputs.push_back(child);
+    } else if (child->projectOut()) {
+      outputOnly.push_back(child);
+    }
+  }
+
+  if (filterInputs.empty() || outputOnly.empty()) {
+    return;
+  }
+
+  for (auto* child : filterInputs) {
+    child->setIoReadClassRecursively(dwio::common::IoReadClass::kFilter);
+  }
+  for (auto* child : outputOnly) {
+    child->setIoReadClassRecursively(dwio::common::IoReadClass::kOutput);
+  }
+}
+
 std::unique_ptr<dwio::common::SerDeOptions> parseSerdeParameters(
     const std::unordered_map<std::string, std::string>& serdeParameters) {
   auto fieldIt = serdeParameters.find(dwio::common::SerDeOptions::kFieldDelim);
@@ -502,6 +533,8 @@ void configureReaderOptions(
   readerOptions.setFilePreloadThreshold(hiveConfig->filePreloadThreshold());
   readerOptions.setPrefetchRowGroups(hiveConfig->prefetchRowGroups());
   readerOptions.setLoadQuantum(hiveConfig->loadQuantum());
+  readerOptions.setEstimatedReadLatencyUs(
+      hiveConfig->parquetLateMaterializationReadLatencyUs(sessionProperties));
   readerOptions.setPrefetchMemoryPercent(hiveConfig->prefetchMemoryPercent());
 
   if (hiveSplit->fileFormat == dwio::common::FileFormat::ORC) {

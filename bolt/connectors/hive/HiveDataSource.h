@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <folly/container/F14Set.h>
 #include <vector>
 
 #include "bolt/common/io/IoStatistics.h"
@@ -253,6 +254,10 @@ class HiveDataSource : public DataSource {
   // Field indices referenced in both remaining filter and output type. These
   // columns need to be materialized eagerly to avoid missing values in output.
   std::vector<column_index_t> multiReferencedFields_;
+
+  // Top-level fields referenced by a remaining filter. These are filter-input
+  // columns even when the expression cannot be converted to a ScanSpec filter.
+  folly::F14FastSet<std::string> remainingFilterFields_;
 
   // Reusable memory for remaining filter evaluation.
   VectorPtr filterResult_;

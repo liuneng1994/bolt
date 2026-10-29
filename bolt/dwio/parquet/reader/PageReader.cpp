@@ -377,6 +377,217 @@ void PageReader::StreamingRepDefStateDeleter::operator()(
 
 PageReader::~PageReader() = default;
 
+void PageReader::loadOffsetIndex() {
+  if (offsetIndexLoaded_) {
+    return;
+  }
+  offsetIndexLoaded_ = true;
+  if (!offsetIndexStream_ || offsetIndexLength_ == 0) {
+    return;
+  }
+  try {
+    std::string buffer(offsetIndexLength_, '\0');
+    offsetIndexStream_->readFully(buffer.data(), buffer.size());
+    if (statis_) {
+      statis_->offsetIndexBytesRead += offsetIndexLength_;
+    }
+    thrift::OffsetIndex offsetIndex;
+    uint32_t length = offsetIndexLength_;
+    thrift::ThriftDeserializer deserializer;
+    deserializer.DeserializeUnencryptedMessage(
+        reinterpret_cast<const uint8_t*>(buffer.data()), &length, &offsetIndex);
+    BOLT_CHECK(!offsetIndex.page_locations.empty());
+    indexedPages_.reserve(offsetIndex.page_locations.size());
+    uint64_t previousEnd = 0;
+    int64_t previousRow = -1;
+    for (const auto& location : offsetIndex.page_locations) {
+      BOLT_CHECK_GE(location.offset, 0);
+      BOLT_CHECK_GT(location.compressed_page_size, 0);
+      BOLT_CHECK_GE(location.first_row_index, 0);
+      BOLT_CHECK_LT(location.first_row_index, rowsInRowGroup_);
+      const auto absoluteOffset = static_cast<uint64_t>(location.offset);
+      BOLT_CHECK_GE(absoluteOffset, chunkFileOffset_);
+      const auto relativeOffset = absoluteOffset - chunkFileOffset_;
+      BOLT_CHECK_LE(relativeOffset, static_cast<uint64_t>(chunkSize_));
+      BOLT_CHECK_LE(
+          static_cast<uint64_t>(location.compressed_page_size),
+          static_cast<uint64_t>(chunkSize_) - relativeOffset);
+      if (!indexedPages_.empty()) {
+        BOLT_CHECK_GE(relativeOffset, previousEnd);
+        BOLT_CHECK_GT(location.first_row_index, previousRow);
+      } else {
+        BOLT_CHECK_EQ(location.first_row_index, 0);
+      }
+      indexedPages_.push_back(IndexedPageLocation{
+          relativeOffset,
+          static_cast<uint32_t>(location.compressed_page_size),
+          location.first_row_index});
+      previousEnd =
+          relativeOffset + static_cast<uint64_t>(location.compressed_page_size);
+      previousRow = location.first_row_index;
+    }
+    offsetIndexUsable_ = true;
+  } catch (const std::exception& e) {
+    indexedPages_.clear();
+    offsetIndexUsable_ = false;
+    if (statis_) {
+      ++statis_->offsetIndexFallbacks;
+    }
+    VLOG(1) << "Ignoring invalid Parquet OffsetIndex: " << e.what();
+  }
+  offsetIndexStream_.reset();
+}
+
+void PageReader::seekInputTo(uint64_t offset) {
+  const std::vector<uint64_t> positions{offset};
+  dwio::common::PositionProvider position(positions);
+  inputStream_->seekToPosition(position);
+  bufferStart_ = bufferEnd_ = nullptr;
+  pageStart_ = offset;
+  pageDataStart_ = offset;
+  pageData_ = nullptr;
+  encodedDataSize_ = 0;
+}
+
+bool PageReader::ensureIndexedSeekSupported() {
+  if (indexedSeekChecked_) {
+    return offsetIndexUsable_;
+  }
+  indexedSeekChecked_ = true;
+  loadOffsetIndex();
+  if (!offsetIndexUsable_ || indexedPages_.empty() ||
+      cryptoCtx_.dataDecryptor || cryptoCtx_.metaDecryptor) {
+    if (offsetIndexUsable_ && statis_) {
+      ++statis_->offsetIndexFallbacks;
+    }
+    offsetIndexUsable_ = false;
+    return false;
+  }
+  if (maxRepeat_ == 0) {
+    return true;
+  }
+
+  // Nested DataPageV1 stores rep/def levels and values in one compressed body.
+  // Jumping these pages cannot avoid value I/O safely. Inspect the first data
+  // page and only enable indexed seeks for DataPageV2.
+  seekInputTo(indexedPages_.front().offset);
+  const auto header = readPageHeader();
+  const bool dataPageV2 = header.type == thrift::PageType::DATA_PAGE_V2;
+  seekInputTo(0);
+  rowOfPage_ = 0;
+  numRowsInPage_ = 0;
+  numRepDefsInPage_ = 0;
+  pageIndex_ = -1;
+  pageOrdinal_ = 0;
+  currentIndexedPage_ = -1;
+  offsetIndexUsable_ = dataPageV2;
+  if (!dataPageV2 && statis_) {
+    ++statis_->offsetIndexFallbacks;
+  }
+  return offsetIndexUsable_;
+}
+
+bool PageReader::trySeekToIndexedPage(int64_t row) {
+  if (row < 0 || !ensureIndexedSeekSupported() ||
+      (hasDictionaryPage_ && !dictionaryPrepared_)) {
+    return false;
+  }
+
+  int32_t targetPage = -1;
+  int64_t targetRow = 0;
+  if (maxRepeat_ == 0) {
+    auto it = std::upper_bound(
+        indexedPages_.begin(),
+        indexedPages_.end(),
+        row,
+        [](int64_t value, const IndexedPageLocation& page) {
+          return value < page.firstRow;
+        });
+    if (it == indexedPages_.begin()) {
+      targetPage = 0;
+    } else {
+      targetPage = static_cast<int32_t>(it - indexedPages_.begin() - 1);
+    }
+    targetRow = indexedPages_[targetPage].firstRow;
+  } else {
+    if (!hasChunkRepDefs_ || numLeavesInPage_.empty() ||
+        numLeavesInPageBase_ >= indexedPages_.size()) {
+      VLOG(2) << "Cannot use nested Parquet OffsetIndex: hasChunkRepDefs="
+              << hasChunkRepDefs_
+              << ", numLeavesInPageBase=" << numLeavesInPageBase_
+              << ", leafPageCounts=" << numLeavesInPage_.size()
+              << ", indexedPages=" << indexedPages_.size();
+      return false;
+    }
+    int64_t firstLeaf = firstLeafInPageBase_;
+    const auto knownPages = std::min<size_t>(
+        numLeavesInPage_.size(), indexedPages_.size() - numLeavesInPageBase_);
+    for (size_t i = 0; i < knownPages; ++i) {
+      const auto nextLeaf = firstLeaf + numLeavesInPage_[i];
+      if (row < nextLeaf) {
+        targetPage = numLeavesInPageBase_ + static_cast<int32_t>(i);
+        targetRow = firstLeaf;
+        break;
+      }
+      firstLeaf = nextLeaf;
+    }
+  }
+
+  if (targetPage <= currentIndexedPage_ + 1) {
+    VLOG(2) << "Nested/scalar Parquet OffsetIndex seek is adjacent: target="
+            << targetPage << ", current=" << currentIndexedPage_;
+    return false;
+  }
+  const auto skippedPages = targetPage - currentIndexedPage_ - 1;
+  seekInputTo(indexedPages_[targetPage].offset);
+  rowOfPage_ = targetRow;
+  numRowsInPage_ = 0;
+  numRepDefsInPage_ = 0;
+  pageIndex_ = targetPage - 1;
+  pageOrdinal_ = targetPage;
+  currentIndexedPage_ = targetPage - 1;
+  if (statis_) {
+    statis_->totalPages += skippedPages;
+    statis_->filteredOutPages += skippedPages;
+    statis_->offsetIndexPagesSkipped += skippedPages;
+  }
+  return true;
+}
+
+bool PageReader::prefetchSelectedPages(const RowSet& topLevelRows) {
+  if (topLevelRows.empty() || !ensureIndexedSeekSupported()) {
+    return false;
+  }
+  std::vector<bool> selected(indexedPages_.size(), false);
+  size_t page = 0;
+  for (const auto row : topLevelRows) {
+    while (page + 1 < indexedPages_.size() &&
+           indexedPages_[page + 1].firstRow <= row) {
+      ++page;
+    }
+    selected[page] = true;
+  }
+
+  std::vector<common::Region> ranges;
+  if (hasDictionaryPage_ && indexedPages_.front().offset > 0) {
+    ranges.push_back(common::Region{0, indexedPages_.front().offset});
+  }
+  for (size_t i = 0; i < indexedPages_.size(); ++i) {
+    if (!selected[i]) {
+      continue;
+    }
+    const common::Region pageRegion{
+        indexedPages_[i].offset, indexedPages_[i].compressedSize};
+    if (!ranges.empty() &&
+        ranges.back().offset + ranges.back().length == pageRegion.offset) {
+      ranges.back().length += pageRegion.length;
+    } else {
+      ranges.push_back(pageRegion);
+    }
+  }
+  return inputStream_->prefetchRanges(ranges);
+}
+
 void PageReader::seekToPage(int64_t row, bool keepRepDefRawData) {
   defineDecoder_.reset();
   repeatDecoder_.reset();
@@ -389,6 +600,9 @@ void PageReader::seekToPage(int64_t row, bool keepRepDefRawData) {
   // 'rowOfPage_' is the row number of the first row of the next page.
   rowOfPage_ += numRowsInPage_;
   for (;;) {
+    if (row != kRepDefOnly) {
+      trySeekToIndexedPage(row);
+    }
     auto dataStart = pageStart_;
     if (chunkSize_ <= pageStart_) {
       // This may happen if seeking to exactly end of row group.
@@ -419,6 +633,18 @@ void PageReader::seekToPage(int64_t row, bool keepRepDefRawData) {
     PageHeader pageHeader = readPageHeader();
     pageStart_ = pageDataStart_ + pageHeader.compressed_page_size;
 
+    if (pageHeader.type == thrift::PageType::DATA_PAGE ||
+        pageHeader.type == thrift::PageType::DATA_PAGE_V2) {
+      while (currentIndexedPage_ + 1 < indexedPages_.size() &&
+             indexedPages_[currentIndexedPage_ + 1].offset < dataStart) {
+        ++currentIndexedPage_;
+      }
+      if (currentIndexedPage_ + 1 < indexedPages_.size() &&
+          indexedPages_[currentIndexedPage_ + 1].offset == dataStart) {
+        ++currentIndexedPage_;
+      }
+    }
+
     if (cryptoCtx_.dataDecryptor != nullptr) {
       updateDecryption(
           cryptoCtx_.dataDecryptor, encryption::kDictionaryPage, &dataPageAad_);
@@ -442,6 +668,7 @@ void PageReader::seekToPage(int64_t row, bool keepRepDefRawData) {
           continue;
         }
         prepareDictionary(pageHeader);
+        dictionaryPrepared_ = true;
         continue;
       default:
         break; // ignore INDEX page type and any other custom extensions
@@ -648,6 +875,7 @@ void PageReader::setPageRowInfo(bool forRepDef) {
     numRowsInPage_ = numLeavesInPage_[relativePageIndex];
     if (usesStreamingRepDefs() && relativePageIndex > 0) {
       for (int32_t i = 0; i < relativePageIndex; ++i) {
+        firstLeafInPageBase_ += numLeavesInPage_.front();
         numLeavesInPage_.pop_front();
         ++numLeavesInPageBase_;
       }
@@ -1884,6 +2112,7 @@ void PageReader::preloadRepDefs() {
   pageData_ = nullptr;
   totalRefDefBytes_ = 0;
   pageOrdinal_ = 0;
+  currentIndexedPage_ = -1;
   cryptoCtx_.startDecryptWithDictionaryPage = startWithDictinoaryPage;
 }
 

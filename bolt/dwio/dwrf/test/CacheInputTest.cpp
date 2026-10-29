@@ -507,6 +507,136 @@ TEST_F(CacheTest, enqueuePairTriggersCoalescedLoad) {
   EXPECT_EQ(1, file->numIos() - previous);
 }
 
+TEST_F(CacheTest, separatesFilterAndOutputLoads) {
+  constexpr int32_t kMB = 1 << 20;
+  constexpr int32_t kLength = 64 << 10;
+  constexpr int32_t kGap = 100;
+  gflags::FlagSaver flagSaver;
+  FLAGS_cache_prefetch_min_pct = 101;
+  initializeCache(16 * kMB);
+  auto tracker = std::make_shared<ScanTracker>(
+      "testTracker",
+      nullptr,
+      io::ReaderOptions::kDefaultLoadQuantum,
+      groupStats_);
+  uint64_t fileId;
+  uint64_t groupId;
+  auto file = inputByPath("separate_filter_output", fileId, groupId);
+  auto input = std::make_unique<CachedBufferedInput>(
+      file,
+      MetricsLog::voidLog(),
+      fileId,
+      cache_.get(),
+      tracker,
+      groupId,
+      ioStats_,
+      nullptr,
+      io::ReaderOptions(pool_.get()));
+
+  const Region filterRegion{100, kLength};
+  const Region outputRegion{
+      filterRegion.offset + filterRegion.length + kGap, kLength};
+  StreamIdentifier filterId(0, IoReadClass::kFilter);
+  StreamIdentifier outputId(1, IoReadClass::kOutput);
+  auto filter = input->enqueue(filterRegion, &filterId);
+  auto output = input->enqueue(outputRegion, &outputId);
+
+  const auto previous = file->numIos();
+  input->load(LogType::FILE);
+  EXPECT_EQ(previous, file->numIos());
+
+  auto readAll = [&](SeekableInputStream& stream, const Region& region) {
+    const void* data;
+    int32_t size;
+    int32_t bytesRead = 0;
+    while (stream.Next(&data, &size)) {
+      file->checkData(data, region.offset + bytesRead, size);
+      bytesRead += size;
+    }
+    EXPECT_EQ(region.length, bytesRead);
+  };
+
+  readAll(*filter, filterRegion);
+  EXPECT_EQ(1, file->numIos() - previous);
+  readAll(*output, outputRegion);
+  EXPECT_EQ(2, file->numIos() - previous);
+}
+
+TEST_F(CacheTest, changesQuantumBeforeDeferredLoad) {
+  constexpr int32_t kMB = 1 << 20;
+  constexpr int32_t kDeferredQuantum = 64 << 10;
+  initializeCache(16 * kMB);
+  auto tracker = std::make_shared<ScanTracker>(
+      "testTracker",
+      nullptr,
+      io::ReaderOptions::kDefaultLoadQuantum,
+      groupStats_);
+  uint64_t fileId;
+  uint64_t groupId;
+  auto file = inputByPath("deferred_quantum", fileId, groupId);
+  auto input = std::make_unique<CachedBufferedInput>(
+      file,
+      MetricsLog::voidLog(),
+      fileId,
+      cache_.get(),
+      tracker,
+      groupId,
+      ioStats_,
+      nullptr,
+      io::ReaderOptions(pool_.get()));
+
+  StreamIdentifier outputId(0, IoReadClass::kOutput);
+  auto output = input->enqueue({0, kMB}, &outputId);
+  input->setLoadQuantum(kDeferredQuantum);
+  input->load(LogType::FILE);
+
+  const auto rawBytesBefore = ioStats_->rawBytesRead();
+  const void* data;
+  int32_t size;
+  ASSERT_TRUE(output->Next(&data, &size));
+  EXPECT_EQ(size, kDeferredQuantum);
+  EXPECT_EQ(ioStats_->rawBytesRead() - rawBytesBefore, kDeferredQuantum);
+  file->checkData(data, 0, size);
+}
+
+TEST_F(CacheTest, prefetchesSparseRangesAtCacheQuantum) {
+  constexpr int32_t kMB = 1 << 20;
+  constexpr int32_t kQuantum = 64 << 10;
+  initializeCache(16 * kMB);
+  auto tracker = std::make_shared<ScanTracker>(
+      "testTracker", nullptr, kQuantum, groupStats_);
+  uint64_t fileId;
+  uint64_t groupId;
+  auto file = inputByPath("sparse_range_prefetch", fileId, groupId);
+  io::ReaderOptions options(pool_.get());
+  options.setLoadQuantum(kQuantum);
+  auto input = std::make_unique<CachedBufferedInput>(
+      file,
+      MetricsLog::voidLog(),
+      fileId,
+      cache_.get(),
+      tracker,
+      groupId,
+      ioStats_,
+      executor_.get(),
+      options);
+
+  StreamIdentifier outputId(0, IoReadClass::kOutput);
+  auto output = input->enqueue({0, 4 * kQuantum}, &outputId);
+  input->load(LogType::FILE);
+  const auto previous = file->numIos();
+  ASSERT_TRUE(output->prefetchRanges({Region{2 * kQuantum + 100, 1'000}}));
+
+  const std::vector<uint64_t> positions{2 * kQuantum + 100};
+  PositionProvider positionProvider(positions);
+  output->seekToPosition(positionProvider);
+  const void* data;
+  int32_t size;
+  ASSERT_TRUE(output->Next(&data, &size));
+  file->checkData(data, 2 * kQuantum + 100, size);
+  EXPECT_EQ(file->numIos() - previous, 1);
+}
+
 TEST_F(CacheTest, enqueueLargePairTriggersAllSplitCoalescedLoads) {
   constexpr int32_t kMB = 1 << 20;
   constexpr int32_t kQuantum = 64 << 10;

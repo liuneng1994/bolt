@@ -46,12 +46,17 @@ struct CacheRequest {
   CacheRequest(
       cache::RawFileCacheKey _key,
       uint64_t _size,
-      cache::TrackingId _trackingId)
-      : key(_key), size(_size), trackingId(_trackingId) {}
+      cache::TrackingId _trackingId,
+      IoReadClass _ioReadClass)
+      : key(_key),
+        size(_size),
+        trackingId(_trackingId),
+        ioReadClass(_ioReadClass) {}
 
   cache::RawFileCacheKey key;
   uint64_t size;
   cache::TrackingId trackingId;
+  IoReadClass ioReadClass{IoReadClass::kLegacy};
   cache::CachePin pin;
   cache::SsdPin ssdPin;
 
@@ -135,6 +140,22 @@ class CachedBufferedInput : public BufferedInput {
   }
 
   void load(const LogType /*unused*/) override;
+
+  void loadDeferredOutput(const LogType logType) override;
+
+  void setLoadQuantum(int32_t loadQuantum) override;
+
+  int32_t loadQuantum() const override {
+    return options_.loadQuantum();
+  }
+
+  uint64_t estimatedReadLatencyUs() const override {
+    return options_.estimatedReadLatencyUs();
+  }
+
+  const io::IoStatistics* FOLLY_NULLABLE ioStatistics() const override {
+    return ioStats_.get();
+  }
 
   bool isBuffered(uint64_t offset, uint64_t length) const override;
 

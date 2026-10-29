@@ -115,6 +115,12 @@ class SelectiveStructColumnReaderBase : public SelectiveColumnReader {
     inputRows_ = outputRows_;
   }
 
+  /// Called immediately before a lazy top-level output column is read. Format
+  /// readers can use the final selected rows to schedule deferred output I/O.
+  /// The default is a no-op for formats that don't split predicate and output
+  /// reads.
+  virtual void prepareOutputRead(const RowSet& /*rows*/) {}
+
   const std::string& debugString() const {
     return debugString_;
   }

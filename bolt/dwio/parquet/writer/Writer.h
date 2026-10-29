@@ -202,6 +202,10 @@ struct WriterOptions {
   arrow::ParquetDataPageVersion dataPageVersion =
       arrow::ParquetDataPageVersion::V1;
   bool storeDecimalAsInteger = true;
+  bool writePageIndex = false;
+  // columnPath to writePageIndex. Per-column settings override
+  // writePageIndex.
+  std::unordered_map<std::string, bool> columnWritePageIndexMap;
   uint64_t writeBatchBytes = 40 * 1024 * 1024; // 40M
   vector_size_t minBatchSize = 512;
   // Controls the number of threads to use for ParquetWriter.

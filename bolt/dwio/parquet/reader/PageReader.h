@@ -274,6 +274,24 @@ class PageReader {
     repDefStreamingWindowSize_ = size == 0 ? 0 : std::max(size, 1);
   }
 
+  /// Installs a lazily parsed Parquet OffsetIndex. Offsets in the index are
+  /// absolute file offsets and are converted to positions relative to this
+  /// column-chunk stream.
+  void setOffsetIndexStream(
+      std::unique_ptr<dwio::common::SeekableInputStream> stream,
+      uint32_t length,
+      uint64_t chunkFileOffset,
+      int64_t rowsInRowGroup,
+      bool hasDictionaryPage) {
+    offsetIndexStream_ = std::move(stream);
+    offsetIndexLength_ = length;
+    chunkFileOffset_ = chunkFileOffset;
+    rowsInRowGroup_ = rowsInRowGroup;
+    hasDictionaryPage_ = hasDictionaryPage;
+  }
+
+  bool prefetchSelectedPages(const RowSet& topLevelRows);
+
  private:
   // Indicates that we only want the repdefs for the next page. Used when
   // prereading repdefs with seekToPage.
@@ -282,6 +300,17 @@ class PageReader {
   // In 'numRowsInPage_', indicates that the page's def levels must be
   // consulted to determine number of leaf values.
   static constexpr int32_t kRowsUnknown = -1;
+
+  struct IndexedPageLocation {
+    uint64_t offset;
+    uint32_t compressedSize;
+    int64_t firstRow;
+  };
+
+  void loadOffsetIndex();
+  bool ensureIndexedSeekSupported();
+  bool trySeekToIndexedPage(int64_t row);
+  void seekInputTo(uint64_t offset);
 
   // If the current page has nulls, returns a nulls bitmap owned by 'this'. This
   // is filled for 'numRows' bits.
@@ -577,6 +606,7 @@ class PageReader {
   // Number of leaf values in each data page of column chunk.
   std::deque<int32_t> numLeavesInPage_;
   int32_t numLeavesInPageBase_{0};
+  int64_t firstLeafInPageBase_{0};
 
   // First position in '*levels_' for the range of last decodeRepDefs().
   int32_t repDefBegin_{0};
@@ -699,6 +729,18 @@ class PageReader {
   std::string dataPageHeaderAad_;
   BufferPtr decryptionBuffer_;
   int32_t pageOrdinal_;
+
+  std::unique_ptr<dwio::common::SeekableInputStream> offsetIndexStream_;
+  uint32_t offsetIndexLength_{0};
+  uint64_t chunkFileOffset_{0};
+  int64_t rowsInRowGroup_{0};
+  std::vector<IndexedPageLocation> indexedPages_;
+  bool offsetIndexLoaded_{false};
+  bool offsetIndexUsable_{false};
+  bool indexedSeekChecked_{false};
+  int32_t currentIndexedPage_{-1};
+  bool hasDictionaryPage_{false};
+  bool dictionaryPrepared_{false};
 
   std::list<raw_vector<char>> preloadedRepDefs_;
   int32_t repDefMemoryLimit_{16L << 20};

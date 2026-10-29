@@ -81,6 +81,7 @@ class ReaderOptions : public bolt::ISerializable {
   size_t maxCoalesceBytes_{kDefaultCoalesceBytes};
   int32_t prefetchRowGroups_{kDefaultPrefetchRowGroups};
   int32_t prefetchMemoryPercent_{kDefaultPrefetchMemoryPercent};
+  uint64_t estimatedReadLatencyUs_{0};
 
  public:
   static constexpr size_t kDefaultLoadQuantum = 8 << 20; // 8MB
@@ -103,6 +104,7 @@ class ReaderOptions : public bolt::ISerializable {
     prefetchRowGroups_ = other.prefetchRowGroups_;
     loadQuantum_ = other.loadQuantum_;
     prefetchMemoryPercent_ = other.prefetchMemoryPercent_;
+    estimatedReadLatencyUs_ = other.estimatedReadLatencyUs_;
     return *this;
   }
 
@@ -175,6 +177,11 @@ class ReaderOptions : public bolt::ISerializable {
     return *this;
   }
 
+  ReaderOptions& setEstimatedReadLatencyUs(uint64_t latencyUs) {
+    estimatedReadLatencyUs_ = latencyUs;
+    return *this;
+  }
+
   /**
    * Get the memory allocator.
    */
@@ -210,6 +217,10 @@ class ReaderOptions : public bolt::ISerializable {
     return prefetchMemoryPercent_;
   }
 
+  uint64_t estimatedReadLatencyUs() const {
+    return estimatedReadLatencyUs_;
+  }
+
   // Serialization support
   folly::dynamic serialize() const override {
     folly::dynamic obj = folly::dynamic::object;
@@ -220,6 +231,8 @@ class ReaderOptions : public bolt::ISerializable {
     obj["maxCoalesceBytes"] = static_cast<int64_t>(maxCoalesceBytes_);
     obj["prefetchRowGroups"] = static_cast<int64_t>(prefetchRowGroups_);
     obj["prefetchMemoryPercent"] = static_cast<int64_t>(prefetchMemoryPercent_);
+    obj["estimatedReadLatencyUs"] =
+        static_cast<int64_t>(estimatedReadLatencyUs_);
     return obj;
   }
 
@@ -260,6 +273,11 @@ class ReaderOptions : public bolt::ISerializable {
     if (const auto* p = obj.get_ptr("prefetchMemoryPercent")) {
       if (p->isNumber()) {
         options.prefetchMemoryPercent_ = static_cast<int32_t>(p->asInt());
+      }
+    }
+    if (const auto* p = obj.get_ptr("estimatedReadLatencyUs")) {
+      if (p->isNumber()) {
+        options.estimatedReadLatencyUs_ = static_cast<uint64_t>(p->asInt());
       }
     }
     return options;

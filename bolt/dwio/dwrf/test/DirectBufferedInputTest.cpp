@@ -32,6 +32,7 @@
 #include <folly/Random.h>
 #include <folly/container/F14Map.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include "bolt/common/io/IoStatistics.h"
 #include "bolt/common/memory/MmapAllocator.h"
 #include "bolt/connectors/Connector.h"
@@ -259,6 +260,86 @@ TEST_F(DirectBufferedInputTest, basic) {
   // The first reads in 2 parts and does not coalesce to the second, which reads
   // in one part.
   testLoads({{1000, 9000000}, {9010000, 1000000}}, 3);
+}
+
+TEST_F(DirectBufferedInputTest, separatesFilterAndOutputLoads) {
+  auto input = makeInput();
+  const TestRegion filterRegion{100, 100};
+  const TestRegion outputRegion{300, 100};
+  StreamIdentifier filterId(0, IoReadClass::kFilter);
+  StreamIdentifier outputId(1, IoReadClass::kOutput);
+
+  auto filterStream = input->enqueue(
+      Region{
+          static_cast<uint64_t>(filterRegion.offset),
+          static_cast<uint64_t>(filterRegion.length)},
+      &filterId);
+  auto outputStream = input->enqueue(
+      Region{
+          static_cast<uint64_t>(outputRegion.offset),
+          static_cast<uint64_t>(outputRegion.length)},
+      &outputId);
+  const auto previous = file_->numIos();
+  input->load(LogType::FILE);
+
+  checkRead(filterStream.get(), filterRegion);
+  EXPECT_EQ(previous + 1, file_->numIos());
+
+  checkRead(outputStream.get(), outputRegion);
+  EXPECT_EQ(previous + 2, file_->numIos());
+}
+
+TEST_F(DirectBufferedInputTest, changesQuantumBeforeDeferredLoad) {
+  auto input = makeInput();
+  constexpr int32_t kDeferredQuantum = 64 << 10;
+  constexpr int32_t kRegionSize = 1 << 20;
+  StreamIdentifier outputId(0, IoReadClass::kOutput);
+  auto stream = input->enqueue({0, kRegionSize}, &outputId);
+  input->setLoadQuantum(kDeferredQuantum);
+  input->load(LogType::FILE);
+
+  const auto rawBytesBefore = ioStats_->rawBytesRead();
+  const void* data;
+  int32_t size;
+  ASSERT_TRUE(stream->Next(&data, &size));
+  EXPECT_EQ(size, kDeferredQuantum);
+  EXPECT_EQ(ioStats_->rawBytesRead() - rawBytesBefore, kDeferredQuantum);
+  file_->checkData(data, 0, size);
+}
+
+TEST_F(DirectBufferedInputTest, prefetchesDeferredOutputInParallel) {
+  constexpr int32_t kDeferredQuantum = 64 << 10;
+  constexpr int32_t kRegionSize = 1 << 20;
+  auto hdfsExecutor = std::make_unique<folly::IOThreadPoolExecutor>(
+      4, std::make_shared<folly::NamedThreadFactory>(kAsyncPreloadThreadName));
+  auto input = std::make_unique<DirectBufferedInput>(
+      file_,
+      dwio::common::MetricsLog::voidLog(),
+      1,
+      tracker_,
+      2,
+      ioStats_,
+      hdfsExecutor.get(),
+      *opts_,
+      asyncCtxPtr_);
+  StreamIdentifier outputId0(0, IoReadClass::kOutput);
+  StreamIdentifier outputId1(1, IoReadClass::kOutput);
+  auto output0 = input->enqueue({0, kRegionSize}, &outputId0);
+  auto output1 = input->enqueue({2 * kRegionSize, kRegionSize}, &outputId1);
+  input->setLoadQuantum(kDeferredQuantum);
+  input->loadDeferredOutput(LogType::FILE);
+  hdfsExecutor->join();
+
+  EXPECT_EQ(ioStats_->prefetch().count(), 2);
+  EXPECT_EQ(ioStats_->prefetch().sum(), 2 * kDeferredQuantum);
+  const void* data;
+  int32_t size;
+  ASSERT_TRUE(output0->Next(&data, &size));
+  EXPECT_EQ(size, kDeferredQuantum);
+  file_->checkData(data, 0, size);
+  ASSERT_TRUE(output1->Next(&data, &size));
+  EXPECT_EQ(size, kDeferredQuantum);
+  file_->checkData(data, 2 * kRegionSize, size);
 }
 
 TEST_F(DirectBufferedInputTest, noRedownloadCoalescedPrefetch) {

@@ -1117,5 +1117,32 @@ TEST_F(HiveConnectorTest, extractFiltersFromRemainingFilter) {
       remaining->toString(), "not(lt(ROW[\"c2\"],cast 0 as DECIMAL(20, 0)))");
 }
 
+TEST_F(HiveConnectorTest, configureParquetIoReadClasses) {
+  auto rowType = ROW({"c0", "c1", "c2"}, {BIGINT(), BIGINT(), VARCHAR()});
+  SubfieldFilters filters;
+  filters.emplace(Subfield("c0"), exec::equal(7));
+  auto scanSpec =
+      makeScanSpec(rowType, {}, filters, rowType, {}, {}, pool_.get());
+
+  configureParquetIoReadClasses(*scanSpec, {"c1"});
+
+  EXPECT_EQ(
+      scanSpec->childByName("c0")->ioReadClass(),
+      dwio::common::IoReadClass::kFilter);
+  EXPECT_EQ(
+      scanSpec->childByName("c1")->ioReadClass(),
+      dwio::common::IoReadClass::kFilter);
+  EXPECT_EQ(
+      scanSpec->childByName("c2")->ioReadClass(),
+      dwio::common::IoReadClass::kOutput);
+
+  auto unfiltered = makeScanSpec(
+      rowType, {}, SubfieldFilters{}, rowType, {}, {}, pool_.get());
+  configureParquetIoReadClasses(*unfiltered, {});
+  for (auto* child : unfiltered->stableChildren()) {
+    EXPECT_EQ(child->ioReadClass(), dwio::common::IoReadClass::kLegacy);
+  }
+}
+
 } // namespace
 } // namespace bytedance::bolt::connector::hive

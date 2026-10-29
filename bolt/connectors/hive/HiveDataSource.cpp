@@ -169,6 +169,7 @@ HiveDataSource::HiveDataSource(
       columnNames[readerRowNames[i]] = i;
     }
     for (auto& input : remainingFilterExpr->distinctFields()) {
+      remainingFilterFields_.insert(input->field());
       auto it = columnNames.find(input->field());
       if (it != columnNames.end()) {
         multiReferencedFields_.push_back(it->second);
@@ -230,6 +231,10 @@ HiveDataSource::HiveDataSource(
       expressionEvaluator_,
       runtimeStats_.get(),
       rowIndexColumns);
+  if (hiveConfig_->isParquetLateMaterializationEnabled(
+          connectorQueryCtx_->sessionProperties())) {
+    configureParquetIoReadClasses(*scanSpec_, remainingFilterFields_);
+  }
   if (remainingFilter) {
     bool enableMapSubscriptFilter =
         queryConfig.mapSubscriptFilterPushdownEnabled();
@@ -771,6 +776,10 @@ void HiveDataSource::addDynamicFilter(
   auto& fieldSpec = scanSpec_->getChildByChannel(outputChannel);
   fieldSpec.addFilter(*filter);
   scanSpec_->resetCachedValues(true);
+  if (hiveConfig_->isParquetLateMaterializationEnabled(
+          connectorQueryCtx_->sessionProperties())) {
+    configureParquetIoReadClasses(*scanSpec_, remainingFilterFields_);
+  }
   if (splitReader_) {
     splitReader_->resetFilterCaches();
   }

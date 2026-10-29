@@ -72,6 +72,13 @@ class SeekableInputStream : public google::protobuf::io::ZeroCopyInputStream {
 
   virtual bool SkipInt64(int64_t count) = 0;
 
+  /// Schedules ranges relative to the beginning of this stream. Returns false
+  /// when the stream implementation cannot prefetch sparse ranges.
+  virtual bool prefetchRanges(
+      const std::vector<bolt::common::Region>& /*regions*/) {
+    return false;
+  }
+
   bool Skip(int32_t count) final override {
     return SkipInt64(count);
   }

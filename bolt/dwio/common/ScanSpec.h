@@ -32,6 +32,7 @@
 
 #include "bolt/common/base/SelectivityInfo.h"
 #include "bolt/dwio/common/MetadataFilter.h"
+#include "bolt/dwio/common/StreamIdentifier.h"
 #include "bolt/type/Subfield.h"
 #include "bolt/type/filter/FilterBase.h"
 #include "bolt/vector/BaseVector.h"
@@ -175,6 +176,21 @@ class ScanSpec {
 
   void setExtractValues(bool extractValues) {
     extractValues_ = extractValues;
+  }
+
+  dwio::common::IoReadClass ioReadClass() const {
+    return ioReadClass_;
+  }
+
+  void setIoReadClass(dwio::common::IoReadClass ioReadClass) {
+    ioReadClass_ = ioReadClass;
+  }
+
+  void setIoReadClassRecursively(dwio::common::IoReadClass ioReadClass) {
+    ioReadClass_ = ioReadClass;
+    for (auto& child : children_) {
+      child->setIoReadClassRecursively(ioReadClass);
+    }
   }
 
   bool keepValues() const {
@@ -430,6 +446,7 @@ class ScanSpec {
   VectorPtr constantValue_;
   bool projectOut_ = false;
   bool extractValues_ = false;
+  dwio::common::IoReadClass ioReadClass_ = dwio::common::IoReadClass::kLegacy;
   // True if a string dictionary or flat map in this field should be
   // returned as flat.
   bool makeFlat_ = false;
